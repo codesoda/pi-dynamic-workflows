@@ -249,6 +249,7 @@ Extension state lives outside the repository under `~/.pi/workflows`:
 - global settings and tiers: `~/.pi/workflows/settings.json` and `model-tiers.json`
 - project runs, journals, locks, and saved overrides: `~/.pi/workflows/projects/<project>/`
 - older project-local `.pi/workflows/runs` and `.pi/workflows/saved` remain readable as fallbacks
+- a project-local `<repo>/.pi/workflows/settings.json` is also read, so a repository (or its tooling) can ship workflow defaults — e.g. `persistAgentSessions: true` — with the project. Precedence, later wins: global → project-local file → per-project override under `~/.pi/workflows/projects/<project>/settings.json`
 
 Subagents are in-memory by default. Set `persistAgentSessions: true` to retain full transcripts in Pi's standard session directory. This creates one file per unthreaded call or named thread and may store sensitive material that an agent read, so enable it deliberately.
 
