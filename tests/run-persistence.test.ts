@@ -13,7 +13,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { WORKFLOW_RUNS_DIR } from "../src/config.js";
-import { createRunPersistence, generateRunId, type PersistedRunState } from "../src/run-persistence.js";
+import { WorkflowErrorCode } from "../src/errors.js";
+import {
+  createRunPersistence,
+  generateRunId,
+  INTERRUPTED_AGENT_CAUSE,
+  type PersistedAgentState,
+  type PersistedRunState,
+  settleInterruptedPersistedAgents,
+  settleNonTerminalPersistedAgents,
+} from "../src/run-persistence.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { workflowProjectPaths } from "../src/workflow-paths.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
@@ -309,7 +318,13 @@ test(
       agents: [],
       logs: [],
       journal: [
-        { index: 0, hash: "abc123", result: { ok: true } },
+        {
+          index: 0,
+          callId: "journal-test:0",
+          hash: "abc123",
+          result: { ok: true },
+          storeDelta: { answer: 42 },
+        },
         { index: 1, hash: "def456", result: { value: 42 } },
       ],
       startedAt: "2024-01-01T00:00:00.000Z",
@@ -319,8 +334,10 @@ test(
     const loaded = rp.load("journal-test");
     assert.equal(loaded?.journal?.length, 2);
     assert.equal(loaded?.journal?.[0].index, 0);
+    assert.equal(loaded?.journal?.[0].callId, "journal-test:0");
     assert.equal(loaded?.journal?.[0].hash, "abc123");
     assert.deepEqual(loaded?.journal?.[0].result, { ok: true });
+    assert.deepEqual(loaded?.journal?.[0].storeDelta, { answer: 42 });
   }),
 );
 
@@ -367,6 +384,67 @@ test(
     assert.equal(loaded?.durationMs, 60000);
   }),
 );
+
+test(
+  "createRunPersistence save and load preserves terminal error and errorCode",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    rp.save({
+      runId: "failed-cause",
+      workflowName: "wf",
+      script: "export const meta = { name: 'w', description: 'w' }",
+      status: "failed",
+      error: "script failed",
+      errorCode: WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    });
+    const loaded = rp.load("failed-cause");
+    assert.equal(loaded?.error, "script failed");
+    assert.equal(loaded?.errorCode, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+  }),
+);
+
+test("settleNonTerminalPersistedAgents skips leftover running/queued agents on abort", () => {
+  const agents: PersistedAgentState[] = [
+    { id: 1, label: "done", prompt: "a", status: "done", endedAt: "2024-01-01T00:00:01.000Z" },
+    { id: 2, label: "hang", prompt: "b", status: "running", startedAt: "2024-01-01T00:00:02.000Z" },
+    { id: 3, label: "wait", prompt: "c", status: "queued" },
+    { id: 4, label: "err", prompt: "d", status: "error", error: "boom" },
+  ];
+  const settled = settleNonTerminalPersistedAgents(
+    agents,
+    "aborted",
+    { message: "workflow aborted", code: WorkflowErrorCode.WORKFLOW_ABORTED },
+    "2024-01-01T00:00:10.000Z",
+  );
+  assert.equal(settled[0]?.status, "done");
+  assert.equal(settled[1]?.status, "skipped");
+  assert.equal(settled[1]?.error, "aborted");
+  assert.equal(settled[1]?.errorCode, WorkflowErrorCode.WORKFLOW_ABORTED);
+  assert.equal(settled[1]?.endedAt, "2024-01-01T00:00:10.000Z");
+  assert.equal(settled[2]?.status, "skipped");
+  assert.equal(settled[3]?.status, "error");
+  assert.equal(settled[3]?.error, "boom");
+});
+
+test("settleNonTerminalPersistedAgents is a no-op for paused runs", () => {
+  const agents: PersistedAgentState[] = [{ id: 1, label: "hang", prompt: "b", status: "running" }];
+  const settled = settleNonTerminalPersistedAgents(agents, "paused", undefined, "2024-01-01T00:00:10.000Z");
+  assert.equal(settled[0]?.status, "running");
+  assert.equal(settled[0]?.error, undefined);
+});
+
+test("settleInterruptedPersistedAgents skips leftover agents regardless of run status", () => {
+  const agents: PersistedAgentState[] = [{ id: 1, label: "hang", prompt: "b", status: "running" }];
+  const settled = settleInterruptedPersistedAgents(agents, INTERRUPTED_AGENT_CAUSE, "2024-01-01T00:00:10.000Z");
+  assert.equal(settled[0]?.status, "skipped");
+  assert.equal(settled[0]?.error, "interrupted");
+  assert.equal(settled[0]?.endedAt, "2024-01-01T00:00:10.000Z");
+});
 
 test("generateRunId returns a string with timestamp and random parts", () => {
   const id = generateRunId();
@@ -689,7 +767,7 @@ test(
 );
 
 test(
-  "createRunPersistence retention: terminal runs beyond the cap are evicted oldest-first; running/paused survive purely because of the status filter, not save order",
+  "createRunPersistence retention keeps active and undelivered runs while evicting the oldest delivered terminals",
   withTempCwd(async (cwd) => {
     const rp = createRunPersistence(cwd, undefined, { maxTerminalRunsOnDisk: 3 });
 
@@ -704,8 +782,12 @@ test(
     // masking whether the status filter does anything at all.
     rp.save(baseRunState("still-running", "2023-01-01T00:00:00.000Z", "running"));
     rp.save(baseRunState("still-paused", "2023-01-01T00:00:00.000Z", "paused"));
+    rp.save({
+      ...baseRunState("still-pending", "2023-01-01T00:00:00.000Z", "completed"),
+      pendingDelivery: { kind: "complete" },
+    });
 
-    // Now enough terminal runs (saved after, so newer) to exceed the cap.
+    // Now enough delivered terminal runs (saved after, so newer) to exceed the cap.
     for (let i = 0; i < 5; i++) {
       rp.save(baseRunState(`terminal-${i}`, `2024-01-0${i + 1}T00:00:00.000Z`, "completed"));
     }
@@ -726,6 +808,7 @@ test(
       runIds.includes("still-paused"),
       "a paused run survives even though it has the OLDEST updatedAt of everything saved here",
     );
+    assert.ok(runIds.includes("still-pending"), "an undelivered terminal run is not evicted");
     assert.equal(rp.load("terminal-0"), null, "an evicted run's file is actually gone from disk");
   }),
 );
@@ -989,12 +1072,40 @@ test(
       status: "running",
       script: "export const meta = { name: 'w', description: 'd' }\nawait agent('x',{label:'x'})\nreturn 1",
       phases: [],
-      agents: [],
+      agents: [{ id: 1, label: "x", prompt: "x", status: "running" }],
       logs: [],
     } as PersistedRunState);
     // A fresh manager (the previous process died) should recover the orphan.
     new WorkflowManager({ cwd });
-    assert.equal(rp.load("stale")?.status, "paused", "stale running -> paused (journal preserved for resume)");
+    const recovered = rp.load("stale");
+    assert.equal(recovered?.status, "paused", "stale running -> paused (journal preserved for resume)");
+    assert.equal(recovered?.agents[0]?.status, "skipped", "orphaned in-flight agents cannot still be running");
+    assert.equal(recovered?.agents[0]?.error, "interrupted");
+  }),
+);
+
+test(
+  "WorkflowManager settles leftover running agents on an orphaned paused run",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    rp.save({
+      runId: "paused-ghost",
+      workflowName: "w",
+      status: "paused",
+      script: "export const meta = { name: 'w', description: 'd' }\nawait agent('x',{label:'x'})\nreturn 1",
+      phases: [],
+      agents: [{ id: 1, label: "x", prompt: "x", status: "running" }],
+      logs: ["still going"],
+      startedAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    });
+    new WorkflowManager({ cwd });
+    const recovered = rp.load("paused-ghost");
+    assert.equal(recovered?.status, "paused");
+    assert.equal(recovered?.agents[0]?.status, "skipped");
+    assert.equal(recovered?.agents[0]?.error, "interrupted");
+    assert.ok(recovered?.agents[0]?.endedAt);
+    assert.deepEqual(recovered?.logs, ["still going"]);
   }),
 );
 

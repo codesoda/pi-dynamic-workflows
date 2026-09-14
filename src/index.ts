@@ -56,16 +56,24 @@ export {
   splitModelSpecThinking,
   THINKING_LEVELS,
 } from "./model-spec.js";
-export type { ModelTierConfig, RankableModel } from "./model-tier-config.js";
+export type { ModelTierConfig, ModelTierConfigOptions, RankableModel } from "./model-tier-config.js";
 export {
   buildDefaultTierConfig,
   formatTierFallbackNotice,
   getModelTierConfigPath,
+  getProjectModelTierConfigPath,
   loadModelTierConfig,
   resolveTierModel,
   saveModelTierConfig,
   sortedTierNames,
 } from "./model-tier-config.js";
+export type {
+  ModelSource,
+  PreSpawnModelContext,
+  PreSpawnModelDecision,
+  PreSpawnModelResolver,
+} from "./pre-spawn-model.js";
+export { getPreSpawnModelResolver, setPreSpawnModelResolver } from "./pre-spawn-model.js";
 export type { PendingDeliveryMarker, PersistedRunState, RunPersistence, RunStatus } from "./run-persistence.js";
 export { createRunPersistence, generateRunId } from "./run-persistence.js";
 export {
@@ -87,6 +95,8 @@ export {
   suspendResultDelivery,
   suspendSessionDelivery,
   type TaskPanelOptions,
+  WORKFLOW_LIFECYCLE_EVENT,
+  type WorkflowLifecycleEvent,
 } from "./task-panel.js";
 export type {
   AutoResumeDelayParams,
@@ -162,7 +172,12 @@ export {
   workflowUserSavedDir,
 } from "./workflow-paths.js";
 export type { SavedWorkflow, WorkflowStorage } from "./workflow-saved.js";
-export { assertSafeSavedWorkflowName, createWorkflowStorage, isSafeSavedWorkflowName } from "./workflow-saved.js";
+export {
+  assertSafeSavedWorkflowName,
+  createWorkflowStorage,
+  isSafeSavedWorkflowName,
+  resolveSavedScriptPath,
+} from "./workflow-saved.js";
 export type { WorkflowSettings, WorkflowSettingsOptions, WorkflowSettingsStore } from "./workflow-settings.js";
 export {
   getProjectLocalWorkflowSettingsPath,

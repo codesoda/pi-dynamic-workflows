@@ -1,7 +1,21 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
-import type { AgentUsage } from "../src/agent.js";
+import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
+import type { AgentDefinition } from "../src/agent-registry.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { type JournalEntry, parseWorkflowScript, runWorkflow } from "../src/workflow.js";
 
@@ -48,6 +62,185 @@ function createDeferred<T = void>(): { promise: Promise<T>; resolve: (value: T |
     resolve = r;
   });
   return { promise, resolve };
+}
+
+test("agent cwd is normalized before dispatch and invalid cwd does not reserve capacity", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-agent-cwd-"));
+  const linked = join(root, "linked");
+  symlinkSync(root, linked);
+  const seen: string[] = [];
+  const runner = {
+    async run(_prompt: string, options: AgentRunOptions) {
+      seen.push(options.cwd ?? "");
+      return "ok";
+    },
+  };
+  try {
+    const script = `export const meta = { name: 'cwd', description: 'cwd validation' }
+return await agent('inspect', { cwd: ${JSON.stringify(linked)} })`;
+    await runWorkflow(script, { agent: runner, persistLogs: false });
+    assert.deepEqual(seen, [realpathSync(root)], "runner receives the canonical realpath");
+
+    await assert.rejects(
+      () =>
+        runWorkflow(
+          `export const meta = { name: 'bad_cwd', description: 'bad cwd' }
+await agent('never runs', { cwd: 'relative-path' })`,
+          { agent: runner, persistLogs: false, maxAgents: 0 },
+        ),
+      /cwd must be an absolute directory/,
+      "cwd validation precedes capacity reservation",
+    );
+    assert.equal(seen.length, 1, "invalid cwd never dispatches an agent");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("script agent cwd preserves a directory's significant trailing space", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-agent-cwd-space-"));
+  const target = join(root, "directory ");
+  mkdirSync(join(root, "directory"));
+  mkdirSync(target);
+  try {
+    let seen: string | undefined;
+    await runWorkflow(
+      `export const meta = { name: 'cwd_space', description: 'literal directory binding' }
+return await agent('inspect', { cwd: ${JSON.stringify(target)} })`,
+      {
+        agent: {
+          async run(_prompt, options) {
+            seen = options?.cwd;
+            return "ok";
+          },
+        },
+        persistLogs: false,
+      },
+    );
+    assert.equal(seen, realpathSync(target));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("explicit cwd can opt out of agent-type isolation without claiming worktree ownership", async () => {
+  const target = mkdtempSync(join(tmpdir(), "pi-agent-cwd-optout-"));
+  const registry = new Map([
+    [
+      "isolated",
+      {
+        name: "isolated",
+        prompt: "inspect",
+        isolation: "worktree",
+        source: "project",
+      } as AgentDefinition,
+    ],
+  ]);
+  const script = `export const meta = { name: 'cwd_optout', description: 'existing directory ownership' }
+return await agent('inspect', { cwd: ${JSON.stringify(target)}, agentType: 'isolated', isolation: false })`;
+  try {
+    for (const fail of [false, true]) {
+      const ended: Array<string | undefined> = [];
+      const run = runWorkflow(script, {
+        persistLogs: false,
+        agentRegistry: registry,
+        agent: {
+          async run(_prompt, options) {
+            assert.equal(options?.cwd, realpathSync(target));
+            if (fail)
+              throw new WorkflowError("test failure", WorkflowErrorCode.AGENT_EXECUTION_ERROR, { recoverable: false });
+            return "ok";
+          },
+        },
+        onAgentEnd: (event) => ended.push(event.worktree),
+      });
+      if (fail) await assert.rejects(run, /test failure/);
+      else await run;
+      assert.deepEqual(ended, [undefined], "an existing directory is not an owned worktree");
+      assert.ok(existsSync(target));
+    }
+  } finally {
+    rmSync(target, { recursive: true, force: true });
+  }
+});
+
+test("agent cwd cannot be combined with worktree isolation", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-agent-cwd-isolation-"));
+  try {
+    await assert.rejects(
+      () =>
+        runWorkflow(
+          `export const meta = { name: 'cwd_isolation', description: 'cwd and isolation' }
+await agent('never runs', { cwd: ${JSON.stringify(root)}, isolation: 'worktree' })`,
+          { agent: countingAgent().runner, persistLogs: false },
+        ),
+      /cwd cannot be combined with worktree isolation/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("agent cwd participates in resume identity while omitted cwd preserves cache replay", async () => {
+  const firstDir = mkdtempSync(join(tmpdir(), "pi-agent-cwd-first-"));
+  const secondDir = mkdtempSync(join(tmpdir(), "pi-agent-cwd-second-"));
+  const calls: string[] = [];
+  const journal = new Map<string, JournalEntry>();
+  const runner = {
+    async run(_prompt: string, options: AgentRunOptions) {
+      calls.push(options.cwd ?? "default");
+      return `ran:${options.cwd ?? "default"}`;
+    },
+  };
+  const script = (cwd?: string) => `export const meta = { name: 'cwd_resume', description: 'cwd resume identity' }
+return await agent('inspect', { label: 'inspect'${cwd ? `, cwd: ${JSON.stringify(cwd)}` : ""} })`;
+  try {
+    await runWorkflow(script(), {
+      agent: runner,
+      persistLogs: false,
+      runId: "cwd-resume",
+      onAgentJournal: (entry) => journal.set(`${entry.runId}:${entry.index}`, entry),
+    });
+    await runWorkflow(script(), {
+      agent: runner,
+      persistLogs: false,
+      runId: "cwd-resume",
+      resumeJournal: journal,
+    });
+    assert.deepEqual(calls, ["default"], "omitted cwd retains the existing resume hash");
+
+    await runWorkflow(script(firstDir), {
+      agent: runner,
+      persistLogs: false,
+      runId: "cwd-resume",
+      resumeJournal: journal,
+    });
+    await runWorkflow(script(secondDir), {
+      agent: runner,
+      persistLogs: false,
+      runId: "cwd-resume",
+      resumeJournal: journal,
+    });
+    assert.deepEqual(
+      calls,
+      ["default", realpathSync(firstDir), realpathSync(secondDir)],
+      "each canonical cwd invalidates the prior journal entry",
+    );
+  } finally {
+    rmSync(firstDir, { recursive: true, force: true });
+    rmSync(secondDir, { recursive: true, force: true });
+  }
+});
+function createGitRepo(prefix: string): string {
+  const repo = mkdtempSync(join(tmpdir(), prefix));
+  const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
+  git("init", "-q");
+  git("config", "user.email", "t@t.t");
+  git("config", "user.name", "t");
+  writeFileSync(join(repo, "base.txt"), "base\n");
+  git("add", ".");
+  git("commit", "-q", "-m", "init");
+  return repo;
 }
 
 test("runWorkflow concurrency caps parallel agents", async () => {
@@ -243,6 +436,85 @@ return a`,
   assert.equal(journal.length, 1, "only the final success is journaled");
 });
 
+test("runWorkflow reconciles timeout fallback with exact abort-teardown usage", { timeout: 2_500 }, async () => {
+  const exactUsage: AgentUsage = {
+    input: 900,
+    output: 100,
+    total: 1_000,
+    cost: 0.5,
+    cacheRead: 0,
+    cacheWrite: 0,
+  };
+  const result = await runWorkflow(
+    `export const meta = { name: 'timeout_usage', description: 'timeout usage' }
+return await agent('short prompt', { label: 'slow', timeoutMs: 5 })`,
+    {
+      agent: {
+        async run(prompt: string, options?: AgentRunOptions) {
+          void prompt;
+          return new Promise((resolve, reject) => {
+            void resolve;
+            options?.signal?.addEventListener(
+              "abort",
+              () => {
+                setTimeout(() => {
+                  options.onUsage?.(exactUsage);
+                  reject(new Error("aborted after exact usage"));
+                }, 1_100);
+              },
+              { once: true },
+            );
+          });
+        },
+      },
+      persistLogs: false,
+    },
+  );
+
+  assert.equal(result.result, null);
+  assert.deepEqual(result.tokenUsage, exactUsage);
+});
+
+test("runWorkflow waits for timed-out teardown before starting a retry", { timeout: 3_000 }, async () => {
+  let calls = 0;
+  let active = 0;
+  let maxActive = 0;
+  const releaseFirstAttempt = createDeferred<void>();
+  const run = runWorkflow(
+    `export const meta = { name: 'slow_teardown', description: 'slow timeout teardown' }
+return await agent('stuck', { label: 'stuck', timeoutMs: 5, retries: 1 })`,
+    {
+      agent: {
+        async run(prompt: string) {
+          void prompt;
+          calls++;
+          active++;
+          maxActive = Math.max(maxActive, active);
+          try {
+            if (calls === 1) {
+              await releaseFirstAttempt.promise;
+              throw new Error("aborted after slow teardown");
+            }
+            return "retry-result";
+          } finally {
+            active--;
+          }
+        },
+      },
+      persistLogs: false,
+    },
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 1_050));
+  assert.equal(calls, 1, "a retry must not overlap a timed-out runner still tearing down");
+  releaseFirstAttempt.resolve(undefined);
+  const result = await run;
+
+  assert.equal(result.result, "retry-result");
+  assert.equal(calls, 2);
+  assert.equal(maxActive, 1);
+});
+
 test("runWorkflow returns null when recoverable retries are exhausted", async () => {
   let calls = 0;
   const logs: string[] = [];
@@ -339,6 +611,77 @@ test("runWorkflow accumulates real per-agent usage (incl. cost + cache tokens)",
   assert.equal(result.tokenUsage?.cacheWrite, 20, "cacheWrite accumulates across agents");
 });
 
+test("runWorkflow streams cumulative token usage before an agent returns", async () => {
+  const release = createDeferred<void>();
+  const usageEvents: number[] = [];
+  const finalizedUsageEvents: number[] = [];
+  let settled = false;
+  const run = runWorkflow(
+    `export const meta = { name: 'live_usage', description: 'live token usage' }
+     return await agent('work', { label: 'worker' })`,
+    {
+      agent: {
+        async run(prompt, options) {
+          void prompt;
+          options?.onUsageProgress?.({ input: 7, output: 3, total: 10, cost: 0.01, cacheRead: 0, cacheWrite: 0 });
+          options?.onUsageProgress?.({ input: 17, output: 8, total: 25, cost: 0.02, cacheRead: 0, cacheWrite: 0 });
+          await release.promise;
+          options?.onUsage?.({ input: 12, output: 8, total: 20, cost: 0.02, cacheRead: 0, cacheWrite: 0 });
+          return "done";
+        },
+      },
+      persistLogs: false,
+      onAgentUsage: (event) => usageEvents.push(event.tokenUsage.total),
+      onTokenUsage: (usage) => finalizedUsageEvents.push(usage.total),
+    },
+  ).finally(() => {
+    settled = true;
+  });
+
+  while (usageEvents.length < 2) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert.equal(settled, false, "usage should be observable while the agent is still running");
+  assert.deepEqual(usageEvents, [10, 25]);
+  assert.deepEqual(finalizedUsageEvents, [], "progress estimates must not change finalized budget accounting");
+
+  release.resolve();
+  const result = await run;
+  assert.equal(result.tokenUsage?.total, 20, "the exact terminal total must replace the progress estimate");
+});
+
+test("onAgentEnd reports cumulative settled usage across retries", async () => {
+  let attempts = 0;
+  let endedTokens: number | undefined;
+  let endedUsage: AgentUsage | undefined;
+  const result = await runWorkflow(
+    `export const meta = { name: 'retry_usage', description: 'retry usage' }
+     return await agent('work', { label: 'worker', retries: 1 })`,
+    {
+      agent: {
+        async run(prompt, options) {
+          void prompt;
+          attempts++;
+          const total = attempts === 1 ? 40 : 25;
+          options?.onUsageProgress?.({ input: 0, output: 100, total: 100, cost: 0, cacheRead: 0, cacheWrite: 0 });
+          options?.onUsage?.({ input: 0, output: total, total, cost: 0, cacheRead: 0, cacheWrite: 0 });
+          return attempts === 1 ? "" : "done";
+        },
+      },
+      persistLogs: false,
+      onAgentEnd: (event) => {
+        endedTokens = event.tokens;
+        endedUsage = event.tokenUsage;
+      },
+    },
+  );
+
+  assert.equal(result.result, "done");
+  assert.equal(attempts, 2);
+  assert.equal(endedTokens, 65);
+  assert.equal(endedUsage?.total, 65);
+});
+
 test("meta.model is parsed and routes as the default model for agents", async () => {
   let seenModel: string | undefined;
   const recorder = {
@@ -352,6 +695,20 @@ await agent('x', { label: 'x' })
 return 1`;
   await runWorkflow(script, { agent: recorder, persistLogs: false });
   assert.equal(seenModel, "meta/default-model", "an agent with no model/tier/phase route uses meta.model");
+});
+
+test("runWorkflow preserves authoritative cost-only terminal usage", async () => {
+  const result = await runWorkflow(
+    `export const meta = { name: 'cost_only', description: 'cost-only provider usage' }
+     return await agent('work', { label: 'worker' })`,
+    {
+      agent: fakeAgent({ input: 0, output: 0, total: 0, cost: 0.25, cacheRead: 0, cacheWrite: 0 }),
+      persistLogs: false,
+    },
+  );
+
+  assert.equal(result.tokenUsage?.total, 0);
+  assert.equal(result.tokenUsage?.cost, 0.25);
 });
 
 test("runWorkflow falls back to an estimate when provider reports total === 0", async () => {
@@ -502,6 +859,384 @@ test("resume replays cached results without re-running agents", async () => {
   });
   assert.equal(second.state.calls, 0, "no live runs on a full cache hit");
   assert.equal(JSON.stringify(r2.result), JSON.stringify(r1.result));
+});
+
+test("script thinking is forwarded, validates before dispatch, and changes journal identity", async () => {
+  const journal: JournalEntry[] = [];
+  const seen: Array<string | undefined> = [];
+  const script = (thinking: string) => `export const meta = { name: 'thinking_identity', description: 'thinking' }
+return await agent('work', { thinking: '${thinking}' })`;
+  await runWorkflow(script("low"), {
+    persistLogs: false,
+    runId: "thinking-run",
+    onAgentJournal: (entry) => journal.push(entry),
+    agent: {
+      async run(_prompt, options) {
+        seen.push(options.thinking);
+        return "low";
+      },
+    },
+  });
+  await runWorkflow(script("high"), {
+    persistLogs: false,
+    runId: "thinking-run",
+    resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+    agent: {
+      async run(_prompt, options) {
+        seen.push(options.thinking);
+        return "high";
+      },
+    },
+  });
+  assert.deepEqual(seen, ["low", "high"], "changed thinking must not replay the old journal result");
+
+  let calls = 0;
+  await assert.rejects(
+    runWorkflow(
+      `export const meta = { name: 'bad_thinking', description: 'bad' }
+return await agent('work', { thinking: 'ultra' })`,
+      {
+        persistLogs: false,
+        agent: {
+          async run() {
+            calls++;
+            return "unexpected";
+          },
+        },
+      },
+    ),
+    /thinking/i,
+  );
+  assert.equal(calls, 0, "invalid script thinking rejects before agent dispatch");
+});
+
+test("requested worktree isolation fails closed before starting a non-git agent", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-worktree-fail-closed-"));
+  let runs = 0;
+  let starts = 0;
+  try {
+    await assert.rejects(
+      runWorkflow(
+        `export const meta = { name: 'fail_closed', description: 'no shared fallback' }
+return await agent('must not run', { isolation: 'worktree' })`,
+        {
+          cwd,
+          agent: {
+            async run() {
+              runs++;
+              return "unexpected";
+            },
+          },
+          persistLogs: false,
+          onAgentStart: () => starts++,
+        },
+      ),
+      (error: unknown) =>
+        error instanceof WorkflowError &&
+        error.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR &&
+        error.recoverable === false,
+    );
+    assert.equal(runs, 0, "isolation failure must not invoke the shared-checkout agent");
+    assert.equal(starts, 0, "the host must not observe an agent start before isolation succeeds");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a journal entry from isolation: false cannot replay after worktree isolation is requested", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-worktree-cache-mode-"));
+  const journal: JournalEntry[] = [];
+  let runs = 0;
+  const script = (isolation: string) => `export const meta = { name: 'cache_mode', description: 'isolation identity' }
+return await agent('same prompt', { label: 'same', isolation: ${isolation} })`;
+  try {
+    await runWorkflow(script("false"), {
+      cwd,
+      runId: "cache-mode",
+      persistLogs: false,
+      onAgentJournal: (entry) => journal.push(entry),
+      agent: {
+        async run() {
+          runs++;
+          return "cached without isolation";
+        },
+      },
+    });
+    await assert.rejects(
+      runWorkflow(script("'worktree'"), {
+        cwd,
+        runId: "cache-mode",
+        persistLogs: false,
+        resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+        agent: {
+          async run() {
+            runs++;
+            return "must not run in a shared checkout";
+          },
+        },
+      }),
+      (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+    );
+    assert.equal(runs, 1, "the false-to-worktree cache miss must fail closed before agent.run");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("keepWorktree changes invalidate isolated journal entries while retained worktrees replay", async () => {
+  const repo = createGitRepo("pi-worktree-cache-retention-");
+  const journal: JournalEntry[] = [];
+  const script = (
+    keepWorktree: boolean,
+  ) => `export const meta = { name: 'cache_retention', description: 'retention identity' }
+return await agent('same prompt', { label: 'same', isolation: 'worktree', keepWorktree: ${keepWorktree} })`;
+  let runs = 0;
+  let liveCwd = "";
+  const runner = {
+    async run(_prompt: string, options: AgentRunOptions) {
+      runs++;
+      liveCwd = options.cwd ?? "";
+      return `live-${runs}`;
+    },
+  };
+  try {
+    await runWorkflow(script(false), {
+      cwd: repo,
+      runId: "cache-retention",
+      persistLogs: false,
+      onAgentJournal: (entry) => journal.push(entry),
+      agent: runner,
+    });
+    assert.equal(existsSync(liveCwd), false, "the first keepWorktree: false tree was removed");
+
+    await runWorkflow(script(true), {
+      cwd: repo,
+      runId: "cache-retention",
+      persistLogs: false,
+      resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+      onAgentJournal: (entry) => journal.push(entry),
+      agent: runner,
+    });
+    assert.equal(runs, 2, "changing retention must not replay an entry whose tree was removed");
+    assert.ok(existsSync(liveCwd), "the keepWorktree: true live retry retains its new tree");
+
+    await runWorkflow(script(true), {
+      cwd: repo,
+      runId: "cache-retention",
+      persistLogs: false,
+      resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+      agent: runner,
+    });
+    assert.equal(runs, 2, "an unchanged valid keepWorktree: true entry replays without agent.run");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("onAgentStart failure still honors worktree retention cleanup", async () => {
+  const repo = createGitRepo("pi-worktree-start-failure-");
+  const script = (keepWorktree: boolean) => `export const meta = { name: 'start_failure', description: 'start cleanup' }
+return await agent('same prompt', { label: 'same', isolation: 'worktree', keepWorktree: ${keepWorktree} })`;
+  try {
+    for (const keepWorktree of [false, true]) {
+      const logs: string[] = [];
+      let runs = 0;
+      await assert.rejects(
+        runWorkflow(script(keepWorktree), {
+          cwd: repo,
+          persistLogs: false,
+          onLog: (message) => logs.push(message),
+          onAgentStart: () => {
+            throw new Error("start callback failed");
+          },
+          agent: {
+            async run() {
+              runs++;
+              return "unexpected";
+            },
+          },
+        }),
+        /start callback failed/,
+      );
+      assert.equal(runs, 0, "a throwing start callback must prevent agent.run");
+      const kept = logs.find((message) => message.startsWith("worktree kept: "));
+      if (!keepWorktree) {
+        assert.equal(kept, undefined, "keepWorktree: false cleans up after the callback failure");
+      } else {
+        assert.ok(kept, "keepWorktree: true still records the retained path through onLog");
+        const cwd = kept?.slice("worktree kept: ".length).split(" (")[0] ?? "";
+        assert.ok(existsSync(cwd), "the logged retained path remains inspectable");
+      }
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("repeated live executions with the same run id and long slug retain independent worktrees", async () => {
+  const repo = createGitRepo("pi-worktree-repeat-");
+  const seen: string[] = [];
+  const script = `export const meta = { name: 'repeat_tree', description: 'unique retained worktrees' }
+return await agent('edit', { label: 'this-is-a-very-long-label-that-shares-the-entire-slug-prefix', isolation: 'worktree' })`;
+  try {
+    const runner = {
+      async run(_prompt: string, options: AgentRunOptions) {
+        const cwd = options.cwd ?? "";
+        seen.push(cwd);
+        if (seen.length === 1) writeFileSync(join(cwd, "first-only.txt"), "first\n");
+        return "ok";
+      },
+    };
+    await runWorkflow(script, { cwd: repo, runId: "same-run-id", agent: runner, persistLogs: false });
+    await runWorkflow(script, { cwd: repo, runId: "same-run-id", agent: runner, persistLogs: false });
+
+    assert.notEqual(seen[0], seen[1], "same run id and truncated slug must not reuse a retained tree");
+    assert.equal(readFileSync(join(seen[0] ?? "", "first-only.txt"), "utf8"), "first\n");
+    assert.equal(existsSync(join(seen[1] ?? "", "first-only.txt")), false);
+    assert.equal(existsSync(join(repo, "first-only.txt")), false);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("worktree success, failure, and abort are retained by default; keepWorktree false cleans up", async () => {
+  const repo = createGitRepo("pi-worktree-retention-");
+  const script = (
+    name: string,
+    options = "",
+  ) => `export const meta = { name: '${name}', description: 'worktree retention' }
+return await agent('${name}', { isolation: 'worktree'${options} })`;
+  try {
+    let successCwd = "";
+    await runWorkflow(script("success"), {
+      cwd: repo,
+      persistLogs: false,
+      agent: {
+        async run(_prompt, options) {
+          successCwd = options.cwd ?? "";
+          writeFileSync(join(successCwd, "success.txt"), "retained\n");
+          return "ok";
+        },
+      },
+    });
+    assert.ok(existsSync(successCwd), "successful worktree is retained");
+
+    let failureCwd = "";
+    await assert.rejects(
+      runWorkflow(script("failure"), {
+        cwd: repo,
+        persistLogs: false,
+        agent: {
+          async run(_prompt, options) {
+            failureCwd = options.cwd ?? "";
+            writeFileSync(join(failureCwd, "failure.txt"), "retained\n");
+            throw new WorkflowError("intentional", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, { recoverable: false });
+          },
+        },
+      }),
+      /intentional/,
+    );
+    assert.ok(existsSync(failureCwd), "failed worktree is retained for inspection");
+
+    const abort = new AbortController();
+    const started = createDeferred<void>();
+    let abortedCwd = "";
+    const abortedRun = runWorkflow(script("abort"), {
+      cwd: repo,
+      signal: abort.signal,
+      persistLogs: false,
+      agent: {
+        async run(_prompt, options) {
+          abortedCwd = options.cwd ?? "";
+          started.resolve();
+          return new Promise<string>((_resolve, reject) => {
+            options.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+          });
+        },
+      },
+    });
+    await started.promise;
+    abort.abort();
+    await assert.rejects(abortedRun, /aborted/);
+    assert.ok(existsSync(abortedCwd), "aborted worktree is retained for inspection");
+
+    let ephemeralCwd = "";
+    await runWorkflow(script("ephemeral", ", keepWorktree: false"), {
+      cwd: repo,
+      persistLogs: false,
+      agent: {
+        async run(_prompt, options) {
+          ephemeralCwd = options.cwd ?? "";
+          return "ok";
+        },
+      },
+    });
+    assert.equal(existsSync(ephemeralCwd), false, "explicit keepWorktree: false removes the worktree");
+    for (const name of ["success.txt", "failure.txt"]) {
+      assert.equal(existsSync(join(repo, name)), false, `${name} must not pollute the base checkout`);
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("replay does not create a worktree; a resume miss creates a fresh tree without base pollution", async () => {
+  const repo = createGitRepo("pi-worktree-resume-");
+  const journal: JournalEntry[] = [];
+  const script = (prompt: string) => `export const meta = { name: 'resume_tree', description: 'retained trees' }
+return await agent('${prompt}', { label: 'same-label', isolation: 'worktree' })`;
+  try {
+    let firstCwd = "";
+    await runWorkflow(script("first"), {
+      cwd: repo,
+      runId: "same-run-id",
+      persistLogs: false,
+      onAgentJournal: (entry) => journal.push(entry),
+      agent: {
+        async run(_prompt, options) {
+          firstCwd = options.cwd ?? "";
+          writeFileSync(join(firstCwd, "marker.txt"), "first\n");
+          return "first";
+        },
+      },
+    });
+
+    let replayCalls = 0;
+    await runWorkflow(script("first"), {
+      cwd: repo,
+      runId: "same-run-id",
+      persistLogs: false,
+      resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+      agent: {
+        async run() {
+          replayCalls++;
+          return "unexpected";
+        },
+      },
+    });
+    assert.equal(replayCalls, 0, "a journal hit must not create or run an agent worktree");
+
+    let missCwd = "";
+    await runWorkflow(script("changed"), {
+      cwd: repo,
+      runId: "same-run-id",
+      persistLogs: false,
+      resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+      agent: {
+        async run(_prompt, options) {
+          missCwd = options.cwd ?? "";
+          writeFileSync(join(missCwd, "marker.txt"), "miss\n");
+          return "miss";
+        },
+      },
+    });
+    assert.notEqual(missCwd, firstCwd, "a resume miss owns a new worktree despite the same run id and label");
+    assert.equal(readFileSync(join(firstCwd, "marker.txt"), "utf8"), "first\n", "replay history remains inspectable");
+    assert.equal(readFileSync(join(missCwd, "marker.txt"), "utf8"), "miss\n");
+    assert.equal(existsSync(join(repo, "marker.txt")), false, "neither live execution mutates the base checkout");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
 });
 
 test("unthreaded agent journal hashes remain compatible with pre-thread runs", async () => {
@@ -715,6 +1450,49 @@ return await agent('threaded child', { thread: 'implementer' })`;
   assert.equal(resumed.state.calls, 2, "the child thread and later parent agent both run live");
   assert.equal(confirmations, 1, "the later parent checkpoint also runs live");
   assert.equal(result.result.confirmed, false);
+});
+
+test("sequential nested workflows assign distinct opaque agent identities", async () => {
+  const agentIds: string[] = [];
+  const childScript = `export const meta = { name: 'child', description: 'one child agent' }
+return await agent('child work', { label: 'worker' })`;
+  await runWorkflow(
+    `export const meta = { name: 'parent', description: 'two sequential child workflows' }
+const first = await workflow('child')
+const second = await workflow('child')
+return [first, second]`,
+    {
+      agent: fakeAgent(),
+      loadSavedWorkflow: (name) => (name === "child" ? childScript : undefined),
+      onAgentStart: (event) => agentIds.push(event.id),
+      persistLogs: false,
+    },
+  );
+
+  assert.equal(agentIds.length, 2);
+  assert.equal(new Set(agentIds).size, 2);
+});
+
+test("parallel sibling workflows can each use the one allowed nesting level", async () => {
+  const agentIds: string[] = [];
+  const childScript = `export const meta = { name: 'child', description: 'parallel child' }
+return await agent('child work', { label: 'worker' })`;
+  const result = await runWorkflow<string[]>(
+    `export const meta = { name: 'parent', description: 'parallel child workflows' }
+return await parallel([
+  () => workflow('child'),
+  () => workflow('child'),
+])`,
+    {
+      agent: fakeAgent({}, "child-result"),
+      loadSavedWorkflow: (name) => (name === "child" ? childScript : undefined),
+      onAgentStart: (event) => agentIds.push(event.id),
+      persistLogs: false,
+    },
+  );
+
+  assert.deepEqual(result.result, ["child-result", "child-result"]);
+  assert.equal(new Set(agentIds).size, 2);
 });
 
 test("workflow() nesting is one level deep (second level throws)", async () => {

@@ -1,15 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { unlinkSync, writeFileSync } from "node:fs";
+import { realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai";
 import {
+  type AgentSessionEvent,
   type CreateAgentSessionOptions,
   createAgentSession,
   createCodingTools,
   DefaultResourceLoader,
   getAgentDir,
   ModelRegistry,
-  ModelRuntime,
+  type ModelRuntime,
   SessionManager,
   SettingsManager,
   type ToolDefinition,
@@ -17,9 +18,20 @@ import {
 import type { Static, TSchema } from "typebox";
 import { Check, Convert } from "typebox/value";
 import { type AgentHistoryEntry, compactAgentHistory } from "./agent-history.js";
+import { type AgentUsage, agentUsageEquals, createEmptyAgentUsage, sumAgentUsage } from "./agent-usage.js";
+import { pinChildCacheRetention } from "./child-cache-retention.js";
+
+export type { AgentUsage } from "./agent-usage.js";
+
 import { applyToolPolicy } from "./agent-registry.js";
 import { classifyProviderLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
-import { canonicalModelSpec, resolveModelSpecWithThinking } from "./model-spec.js";
+import {
+  canonicalModelSpec,
+  formatModelSpecWithThinking,
+  type ModelThinkingLevel,
+  resolveModelSpecWithThinking,
+  validateThinkingLevel,
+} from "./model-spec.js";
 import {
   formatTierFallbackNotice,
   loadModelTierConfig,
@@ -27,7 +39,16 @@ import {
   type RankableModel,
   resolveTierModel,
 } from "./model-tier-config.js";
+import {
+  applyPreSpawnModel,
+  classifyModelSource,
+  getPreSpawnModelResolver,
+  type ModelSource,
+  type PreSpawnModelResolver,
+} from "./pre-spawn-model.js";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.js";
+
+const LIVE_USAGE_EMIT_INTERVAL_MS = 250;
 
 /**
  * Find a JSON object/array in free-form text: a fenced ```json block if present,
@@ -178,7 +199,8 @@ export async function resolveStructuredOutput<T>(
  *      user customizes tiers via /workflows-models.
  * Returns undefined when nothing applies, so the session default is used.
  *
- * `loadConfig` is injectable for testing; it defaults to reading from disk.
+ * `loadConfig` is injectable for testing; it defaults to the global file.
+ * WorkflowAgent passes a cwd-aware overlay loader so project tiers win.
  */
 export function resolveAgentModelSpec(
   options: { model?: string; tier?: string },
@@ -213,7 +235,10 @@ export interface WorkflowAgentOptions {
    * so a workflow subagent can't fan out through them either (#107).
    */
   excludeTools?: string[];
-  /** Override any createAgentSession option (model, modelRuntime, resourceLoader, etc.). */
+  /**
+   * Override createAgentSession dependencies (model, settingsManager, resourceLoader, etc.).
+   * An explicit per-call cwd and the computed agent identity remain authoritative.
+   */
   session?: Partial<CreateAgentSessionOptions>;
   /** Extra system guidance prepended to every subagent task. */
   instructions?: string;
@@ -224,6 +249,12 @@ export interface WorkflowAgentOptions {
    * to the session default when no config is saved yet.
    */
   mainModel?: string;
+  /**
+   * Optional host policy run after DW model-intent resolution and before
+   * createAgentSession. Per-instance; a per-run `AgentRunOptions.preSpawnModel`
+   * overrides this, which overrides {@link setPreSpawnModelResolver}.
+   */
+  preSpawnModel?: PreSpawnModelResolver;
   /**
    * Shared model registry from the host Pi session. When provided, subagents
    * resolve tier/model specs against the same registry the main session uses,
@@ -241,26 +272,55 @@ export interface WorkflowAgentOptions {
   persistAgentSessions?: boolean;
 }
 
-// pi >= 0.80.8: ModelRegistry is a sync facade over an async-created ModelRuntime
-// (AuthStorage/ModelRegistry.create are gone). The disk-backed fallback is built
-// lazily; sync callers see [] until it resolves and real specs on later reads.
-let fallbackRuntimePromise: Promise<ModelRuntime> | undefined;
+// omp's ModelRegistry is auth-storage-backed (no pi >= 0.80.8 sync-facade /
+// runtime split): build it directly from the discovered AuthStorage. The
+// disk-backed fallback is built lazily; sync callers see [] until it resolves
+// and real specs on later reads.
+let fallbackRuntimePromise: Promise<ModelRegistry> | undefined;
 let fallbackRegistry: ModelRegistry | undefined;
 
 function ensureFallbackRegistry(): Promise<ModelRegistry> {
   if (!fallbackRuntimePromise) {
     const dir = getAgentDir();
     // Same auth.json/models.json createAgentSession uses by default, so a model
-    // resolved here carries valid credentials.
+    // resolved here carries valid credentials. Three host shapes, tried in
+    // order; only a real registry ever resolves:
+    // 1. omp's bundled pi exports discoverAuthStorage (auth-storage-backed
+    //    registry, no runtime split).
+    // 2. Legacy pi (< 0.80.8) had a static ModelRegistry.create({ dir }).
+    // 3. pi >= 0.80.8 splits registry/runtime: ModelRuntime.create() then
+    //    new ModelRegistry(runtime).
     fallbackRuntimePromise = (async () => {
-      const runtime = await ModelRuntime.create({
-        authPath: join(dir, "auth.json"),
-        modelsPath: join(dir, "models.json"),
-      });
-      // Warm the availability snapshot so the facade's sync getAvailable() is
-      // populated immediately after this promise resolves.
-      await runtime.getAvailable().catch(() => {});
-      return runtime;
+      // Dynamic import on purpose: discoverAuthStorage exists only in omp's
+      // bundled pi; a static named import would fail to resolve on stock pi,
+      // and the host shape must be feature-detected at runtime.
+      const ompExports = (await import("@earendil-works/pi-coding-agent").catch(() => undefined)) as
+        | {
+            discoverAuthStorage?: (dir: string) => Promise<unknown>;
+            ModelRuntime?: { create?: (options?: unknown) => Promise<ModelRuntime> };
+          }
+        | undefined;
+      if (typeof ompExports?.discoverAuthStorage === "function") {
+        const authStorage = (await ompExports.discoverAuthStorage(dir)) as ConstructorParameters<
+          typeof ModelRegistry
+        >[0];
+        return new ModelRegistry(authStorage);
+      }
+      const legacyCreate = (
+        ModelRegistry as unknown as {
+          create?: (opts: { dir: string }) => Promise<ModelRegistry>;
+        }
+      ).create;
+      if (typeof legacyCreate === "function") return legacyCreate({ dir });
+      const runtimeCreate = ompExports?.ModelRuntime?.create;
+      if (typeof runtimeCreate === "function") {
+        // No options: defaults to getAgentDir()/auth.json and models.json —
+        // the same disk layout the omp and legacy paths read.
+        return new ModelRegistry(await runtimeCreate());
+      }
+      throw new Error(
+        "[workflow] no ModelRegistry construction path in @earendil-works/pi-coding-agent (expected discoverAuthStorage, ModelRegistry.create, or ModelRuntime.create)",
+      );
     })();
     // Don't cache a rejection: a transient failure (e.g. auth.json lock) would
     // otherwise wedge the fallback for the rest of the process.
@@ -268,34 +328,22 @@ function ensureFallbackRegistry(): Promise<ModelRegistry> {
       fallbackRuntimePromise = undefined;
     });
   }
-  return fallbackRuntimePromise.then((runtime) => {
-    fallbackRegistry ??= new ModelRegistry(runtime);
-    return fallbackRegistry;
+  return fallbackRuntimePromise.then((registry) => {
+    fallbackRegistry ??= registry;
+    return registry;
   });
 }
 
-let warnedNoRuntime = false;
-
 /**
- * The ModelRuntime behind a registry facade. pi's ModelRegistry does not expose
- * its runtime publicly, so reach into the private field (stable since 0.80.8);
- * subagent sessions need it to share the host session's exact catalog and auth
- * (createAgentSession takes modelRuntime, not a registry, since 0.80.8).
- *
- * Exported so the test suite can pin this pi-internals contract: the cast means
- * neither tsc nor mock-based tests would notice pi renaming the field, and the
- * runtime consequence is silent (subagents fall back to a default runtime and
- * extension-registered providers vanish from routing).
+ * The ModelRuntime behind a registry facade (pi >= 0.80.8 shape: ModelRegistry
+ * wraps a ModelRuntime but exposes no getter). Subagent sessions need it to
+ * share the host session's exact catalog and auth. omp's fork is
+ * auth-storage-backed (registry has no `runtime` field and createAgentSession
+ * takes modelRegistry instead), so this returns undefined there and callers
+ * pass the registry itself.
  */
-export function runtimeOf(registry: ModelRegistry): ModelRuntime | undefined {
-  const runtime = (registry as unknown as { runtime?: ModelRuntime }).runtime;
-  if (!runtime && !warnedNoRuntime) {
-    warnedNoRuntime = true;
-    console.warn(
-      "[workflow] ModelRegistry no longer carries a private `runtime` field (pi internals changed); subagents fall back to a default-built runtime and may miss extension-registered providers",
-    );
-  }
-  return runtime;
+export function runtimeOf(registry: ModelRegistry): unknown {
+  return (registry as unknown as { runtime?: unknown }).runtime;
 }
 
 /**
@@ -365,16 +413,6 @@ function warnPersistSecretsOnce(sessionDir: string): void {
   );
 }
 
-/** Real token/cost usage for a single subagent run, read from the SDK session. */
-export interface AgentUsage {
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  total: number;
-  cost: number;
-}
-
 /**
  * Map session stats to an AgentUsage, or undefined when the provider reported
  * no usage at all (all-zero stats). Returning undefined — instead of a zero
@@ -397,6 +435,78 @@ export function usageFromStats(stats: {
   };
 }
 
+function estimateStreamingAssistantUsage(event: AgentSessionEvent): AgentUsage | undefined {
+  if (event.type !== "message_update" && event.type !== "message_end") {
+    return undefined;
+  }
+  if (event.message.role !== "assistant") {
+    return undefined;
+  }
+
+  const reported = event.message.usage;
+  const reportedTotal = reported.input + reported.output + reported.cacheRead + reported.cacheWrite;
+  if (reportedTotal > 0 || reported.cost.total > 0) {
+    return {
+      input: reported.input,
+      output: reported.output,
+      cacheRead: reported.cacheRead,
+      cacheWrite: reported.cacheWrite,
+      total: reportedTotal,
+      cost: reported.cost.total,
+    };
+  }
+
+  let streamedCharacters = 0;
+  for (const content of event.message.content) {
+    if (content.type === "text") {
+      streamedCharacters += content.text.length;
+    } else if (content.type === "thinking") {
+      streamedCharacters += content.thinking.length;
+    } else if (content.type === "toolCall") {
+      streamedCharacters += JSON.stringify(content.arguments).length;
+    }
+  }
+  if (streamedCharacters === 0) {
+    return undefined;
+  }
+
+  const estimatedOutput = Math.max(1, Math.ceil(streamedCharacters / 4));
+  return { input: 0, output: estimatedOutput, cacheRead: 0, cacheWrite: 0, total: estimatedOutput, cost: 0 };
+}
+
+type SessionUsageStats = Parameters<typeof usageFromStats>[0];
+
+function subtractSessionUsageStats(stats: SessionUsageStats, baseline?: SessionUsageStats): SessionUsageStats {
+  if (!baseline) {
+    return stats;
+  }
+  return {
+    tokens: {
+      input: Math.max(0, stats.tokens.input - baseline.tokens.input),
+      output: Math.max(0, stats.tokens.output - baseline.tokens.output),
+      cacheRead: Math.max(0, stats.tokens.cacheRead - baseline.tokens.cacheRead),
+      cacheWrite: Math.max(0, stats.tokens.cacheWrite - baseline.tokens.cacheWrite),
+      total: Math.max(0, stats.tokens.total - baseline.tokens.total),
+    },
+    cost: Math.max(0, stats.cost - baseline.cost),
+  };
+}
+
+/**
+ * Combine usage from completed messages with the current streaming message.
+ * AgentSession notifies subscribers before it appends a message_end event to
+ * SessionManager, so the event's assistant usage is absent from stats and must
+ * be added exactly once. The real-session regression test pins this ordering.
+ */
+function usageFromSessionProgress(stats: SessionUsageStats, event: AgentSessionEvent): AgentUsage | undefined {
+  const persisted = usageFromStats(stats);
+  const streaming = estimateStreamingAssistantUsage(event);
+  if (!streaming) {
+    return persisted;
+  }
+  return sumAgentUsage(persisted ?? createEmptyAgentUsage(), streaming);
+}
+
 export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefined> {
   label?: string;
   /**
@@ -410,13 +520,14 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   tools?: ToolDefinition[];
   instructions?: string;
   signal?: AbortSignal;
-  /**
-   * Called once with this subagent's real usage, read from the session right
-   * before disposal. Fires on both the success and error paths so partial
-   * usage is never lost — but NOT when the provider reported no usage at all
-   * (all-zero stats), so consumers keep their scalar fallback.
-   */
+  /** Called once before disposal with exact cumulative provider usage, when reported. */
   onUsage?: (usage: AgentUsage) => void;
+  /**
+   * Called with cumulative progress while the subagent runs. The current
+   * streaming response uses an output-token estimate until the provider's exact
+   * terminal usage replaces it.
+   */
+  onUsageProgress?: (usage: AgentUsage) => void;
   /**
    * Model spec for this subagent: either `provider/modelId` (unambiguous) or a
    * bare `modelId`, parsed with the same grammar as Pi CLI's `--model`. When it
@@ -426,6 +537,11 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * unauthenticated) weights. When omitted, the session default applies.
    */
   model?: string;
+  /**
+   * Pi thinking level. Used when `model` has no `:thinking` suffix.
+   * A model-id suffix still wins.
+   */
+  thinking?: ModelThinkingLevel;
   /**
    * Model tier name (e.g. "small", "medium", "big"). When set (and no explicit
    * `model` is given), the model is resolved from the user's model-tiers.json
@@ -446,6 +562,13 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
    * onModelFallback below for how that degrade stays visible.
    */
   tier?: string;
+  /**
+   * Provenance of `model`/`tier` as known by the caller (workflow layer).
+   * When omitted, {@link classifyModelSource} infers it from model/tier/resolved spec.
+   */
+  modelSource?: ModelSource;
+  /** Per-run host policy; overrides the instance and process resolvers. */
+  preSpawnModel?: PreSpawnModelResolver;
   /** Called with the resolved model id once known (for display/telemetry). */
   onModelResolved?: (modelId: string) => void;
   /**
@@ -510,6 +633,14 @@ export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef 
  * additional tool names via WorkflowAgentOptions.excludeTools.
  */
 export const DEFAULT_EXCLUDED_SUBAGENT_TOOLS = ["workflow", "workflow_control"];
+/** Process-global subagent id counter: unique across concurrent workflow runs. */
+let workflowAgentSeq = 0;
+
+interface ThreadSession {
+  manager: SessionManager;
+  /** Canonical cwd fixed when this named conversation starts. */
+  cwd: string;
+}
 
 /**
  * The full subagent tool denylist: the always-on defaults plus any names the
@@ -531,6 +662,7 @@ export class WorkflowAgent {
   private readonly persistAgentSessions: boolean;
   private readonly instructions?: string;
   private readonly mainModel?: string;
+  private readonly preSpawnModel?: PreSpawnModelResolver;
   /** Shared registry from the host session, when provided. */
   private readonly sharedRegistry?: ModelRegistry;
   /** Lazily built once; shares the SDK's agentDir/auth so resolved models are authed. */
@@ -542,10 +674,10 @@ export class WorkflowAgent {
    */
   private tierConfigBox?: { value: ModelTierConfig | null };
   /**
-   * Shared resource loader for every subagent of this run, built once. See
+   * Resource loaders shared by subagents using the same directory in this run. See
    * getSharedResourceLoader — this is the #109 memory mitigation.
    */
-  private sharedResourceLoaderPromise?: Promise<DefaultResourceLoader>;
+  private readonly resourceLoaders = new Map<string, Promise<DefaultResourceLoader>>();
   /**
    * Emitted at most once per instance (~= once per run, see the class-level
    * lifetime note above): the untagged/default "medium" tier resolved to a
@@ -560,8 +692,10 @@ export class WorkflowAgent {
    * one instance per workflow invocation; embedders that inject and reuse an
    * agent are responsible for choosing the longer thread lifetime deliberately.
    */
-  private readonly threadSessions = new Map<string, SessionManager>();
+  private readonly threadSessions = new Map<string, ThreadSession>();
   private readonly activeThreads = new Set<string>();
+  /** Unique per-instance identity: agent ids must never collide across WorkflowAgent instances. */
+  private readonly agentInstanceId = randomUUID();
 
   constructor(options: WorkflowAgentOptions = {}) {
     this.cwd = options.cwd ?? process.cwd();
@@ -571,11 +705,12 @@ export class WorkflowAgent {
     this.persistAgentSessions = options.persistAgentSessions ?? false;
     this.instructions = options.instructions;
     this.mainModel = options.mainModel;
+    this.preSpawnModel = options.preSpawnModel;
     this.sharedRegistry = options.modelRegistry;
   }
 
   /**
-   * A resource loader shared by every subagent of this run, built once (#109).
+   * A resource loader shared per directory within this run (#109).
    *
    * Without a resourceLoader, createAgentSession() builds a fresh
    * DefaultResourceLoader per subagent and reloads it — re-running EVERY installed
@@ -597,35 +732,37 @@ export class WorkflowAgent {
    * #107 denylist — and must be release-noted. `createAgentSession` with a shared
    * resourceLoader is a supported embedding pattern. runWorkflow builds one
    * WorkflowAgent per run, so this loader's lifetime is exactly one run: built
-   * once, reused by all its subagents, then dropped with the agent.
+   * once per directory, reused there, then dropped with the agent.
    */
-  private getSharedResourceLoader(agentDir: string): Promise<DefaultResourceLoader> {
-    if (!this.sharedResourceLoaderPromise) {
-      this.sharedResourceLoaderPromise = (async () => {
-        const loader = new DefaultResourceLoader({
-          cwd: this.cwd,
-          agentDir,
-          settingsManager: SettingsManager.create(this.cwd, agentDir),
-          noExtensions: true,
-        });
-        await loader.reload();
-        return loader;
-      })().catch((err) => {
-        // Don't let a transient build failure (e.g. EMFILE during reload's disk
-        // I/O) poison every subagent AND every retry of this run — clear the memo
-        // so the next caller rebuilds instead of replaying the same rejection.
-        this.sharedResourceLoaderPromise = undefined;
-        throw err;
+  private getSharedResourceLoader(agentDir: string, cwd = this.cwd): Promise<DefaultResourceLoader> {
+    const key = JSON.stringify([agentDir, cwd]);
+    const existing = this.resourceLoaders.get(key);
+    if (existing) return existing;
+    const pending = (async () => {
+      const loader = new DefaultResourceLoader({
+        cwd,
+        agentDir,
+        settingsManager: this.sessionOptions.settingsManager ?? SettingsManager.create(cwd, agentDir),
+        noExtensions: true,
       });
-    }
-    return this.sharedResourceLoaderPromise;
+      await loader.reload();
+      return loader;
+    })().catch((err) => {
+      // Don't let a transient build failure (e.g. EMFILE during reload's disk
+      // I/O) poison every subagent AND every retry of this run — clear the memo
+      // so the next caller rebuilds instead of replaying the same rejection.
+      this.resourceLoaders.delete(key);
+      throw err;
+    });
+    this.resourceLoaders.set(key, pending);
+    return pending;
   }
 
   /**
    * Resolve the registry for a run: an explicit per-run registry wins, then the
    * constructor's shared registry, then a lazily-built disk registry (shared
-   * across calls once built). Async because pi >= 0.80.8 builds registries from
-   * an async-created ModelRuntime.
+   * shared across calls once built). Async because omp builds registries from an
+   * async-discovered AuthStorage.
    */
   private async getRegistry(perRunRegistry?: ModelRegistry): Promise<ModelRegistry> {
     if (perRunRegistry) {
@@ -641,7 +778,7 @@ export class WorkflowAgent {
   }
 
   /**
-   * Read+parse ~/.pi/workflows/model-tiers.json at most once for this
+   * Read+parse the cwd-aware model-tiers overlay at most once for this
    * instance's lifetime, instead of on every run() call. `resolveAgentModelSpec`
    * previously received `loadModelTierConfig` directly (sync existsSync +
    * readFileSync + JSON.parse from disk), which it calls unconditionally for
@@ -665,9 +802,10 @@ export class WorkflowAgent {
    * only ever consulted once, on the first call, regardless of what is passed
    * on later calls.
    */
-  private loadTierConfig(loader: () => ModelTierConfig | null = loadModelTierConfig): ModelTierConfig | null {
+  private loadTierConfig(loader?: () => ModelTierConfig | null): ModelTierConfig | null {
     if (!this.tierConfigBox) {
-      this.tierConfigBox = { value: loader() };
+      const read = loader ?? (() => loadModelTierConfig({ cwd: this.cwd }));
+      this.tierConfigBox = { value: read() };
     }
     return this.tierConfigBox.value;
   }
@@ -685,10 +823,27 @@ export class WorkflowAgent {
    * agent to an in-memory session instead — the run continues, just without a
    * persisted transcript.
    */
-  private createSessionManager(thread?: string): SessionManager {
+  private createSessionManager(thread?: string, cwd?: string): SessionManager {
     if (thread) {
+      // runTurn always supplies its already-canonical runCwd. Keep the legacy
+      // direct helper path (used by embedders that let SessionManager create a
+      // project directory lazily) intact when no per-call cwd was supplied.
+      const threadCwd = cwd === undefined ? this.cwd : realpathSync(cwd);
       const existing = this.threadSessions.get(thread);
-      if (existing) return existing;
+      if (existing) {
+        if (existing.cwd !== threadCwd) {
+          throw new WorkflowError(
+            `agent thread "${thread}" cannot change cwd from "${existing.cwd}" to "${threadCwd}"`,
+            WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+            { recoverable: false },
+          );
+        }
+        return existing.manager;
+      }
+
+      const manager = this.createSessionManager();
+      this.threadSessions.set(thread, { manager, cwd: threadCwd });
+      return manager;
     }
 
     let manager: SessionManager;
@@ -708,8 +863,6 @@ export class WorkflowAgent {
         manager = SessionManager.inMemory();
       }
     }
-
-    if (thread) this.threadSessions.set(thread, manager);
     return manager;
   }
 
@@ -719,11 +872,26 @@ export class WorkflowAgent {
     writeFileSync(probePath, "");
     unlinkSync(probePath);
   }
+  /**
+   * Unique AgentRegistry id for the next spawned subagent. Concurrent
+   * createAgentSession calls that omit agentId all default to "Main" and race
+   * on the process-global registry (omp: "Agent \"Main\" was replaced during
+   * session initialization"). Unthreaded calls embed a per-process monotonic
+   * sequence so retries and concurrent runs never reuse an id. Named threads
+   * stay stable within one WorkflowAgent instance (a thread is one continuing
+   * session) but embed the instance id, so separate instances/runs never
+   * collide in the process-global registry.
+   */
+  private agentIdFor(options: AgentRunOptions<any>, runCwd: string): string {
+    if (options.thread) return `workflow:${runCwd}:${this.agentInstanceId}:${options.thread}`;
+    return `workflow:${runCwd}:${process.pid}:${++workflowAgentSeq}`;
+  }
 
   async run<TSchemaDef extends TSchema | undefined = undefined>(
     prompt: string,
     options: AgentRunOptions<TSchemaDef> = {},
   ): Promise<AgentRunResult<TSchemaDef>> {
+    validateThinkingLevel(options.thinking);
     const thread = options.thread;
     if (thread && this.activeThreads.has(thread)) {
       throw new WorkflowError(
@@ -750,8 +918,15 @@ export class WorkflowAgent {
     const capture: StructuredOutputCapture<any> = { called: false, value: undefined };
     // Per-call cwd (e.g. a worktree) needs coding tools bound to that directory,
     // since tools capture their cwd at construction and can't be relocated.
-    const runCwd = options.cwd ?? this.cwd;
-    const baseTools = runCwd === this.cwd ? this.baseTools : createCodingTools(runCwd);
+    const runCwd = realpathSync(options.cwd ?? this.cwd);
+    let usesBaseDirectory = false;
+    try {
+      usesBaseDirectory = runCwd === realpathSync(this.cwd);
+    } catch {
+      // An explicitly selected existing directory can outlive the constructor's
+      // original directory. Its tools must not depend on that old path existing.
+    }
+    const baseTools = usesBaseDirectory ? this.baseTools : createCodingTools(runCwd);
     // Apply the agentType tool policy BEFORE adding structured_output, so a
     // restrictive allowlist never strips the schema tool.
     const customTools: ToolDefinition[] = applyToolPolicy(
@@ -789,12 +964,37 @@ export class WorkflowAgent {
     // Resolve the model spec (explicit model > tier > session default). This
     // composes with phase-based routing in workflow.ts, which only supplies
     // options.model when a phase pattern matches — so an explicit model wins.
-    const modelSpec = resolveAgentModelSpec(
+    let modelSpec = resolveAgentModelSpec(
       options,
       this.mainModel,
       () => this.loadTierConfig(),
       () => warnTierUnconfiguredOnce(this.mainModel, modelRegistry),
     );
+
+    const modelSource = classifyModelSource({
+      model: options.model,
+      tier: options.tier,
+      resolvedModel: modelSpec,
+      modelSource: options.modelSource,
+    });
+    const resolver = options.preSpawnModel ?? this.preSpawnModel ?? getPreSpawnModelResolver();
+    let pinAfterPolicy = Boolean(options.model || options.tier);
+    let policySelectedSpec: string | undefined;
+    if (resolver) {
+      const decision = await applyPreSpawnModel(resolver, {
+        requestedModel: options.model,
+        ...(options.thinking !== undefined ? { requestedThinking: options.thinking } : {}),
+        tier: options.tier,
+        resolvedModel: modelSpec,
+        modelSource,
+        label: options.label,
+      });
+      if (decision.action === "use") {
+        modelSpec = decision.model;
+        pinAfterPolicy = true;
+        policySelectedSpec = decision.model;
+      }
+    }
 
     // Resolve a requested model spec to a Model object. Specs use Pi CLI-style
     // parsing, including an optional :thinking suffix such as gpt-5.5:xhigh.
@@ -814,7 +1014,7 @@ export class WorkflowAgent {
     //     that model, so a broken default tier degrades to the session default
     //     instead of failing every untagged agent in the run — but the degrade
     //     still needs to be loud (onModelFallback), not a silent continuation.
-    const isExplicitRequest = Boolean(options.model || options.tier);
+    const isExplicitRequest = pinAfterPolicy;
     let resolvedModel: Model<any> | undefined;
     let resolvedThinkingLevel: CreateAgentSessionOptions["thinkingLevel"] | undefined;
     if (modelSpec) {
@@ -824,11 +1024,14 @@ export class WorkflowAgent {
       if (resolved.warning) console.warn(`[workflow] ${resolved.warning}`);
       if (!resolved.model) {
         if (isExplicitRequest) {
-          // The resolver's error already names the spec and the remedy; the tier
-          // branch swaps in its own message so the config source is named too.
-          const message = options.model
-            ? (resolved.error ?? `Model "${modelSpec}" not found. Use /workflows-models to choose an available model.`)
-            : `tier "${options.tier}" from model-tiers.json resolves to "${modelSpec}", which is not available. Use /workflows-models to choose an available model.`;
+          // Policy `use` pins the spec: name that spec, not the original tier/model.
+          // Otherwise a session/default `use` would report `tier "undefined"`.
+          const message = policySelectedSpec
+            ? `Model "${modelSpec}" selected by preSpawnModel policy was not found. Use /workflows-models to choose an available model.`
+            : options.model
+              ? (resolved.error ??
+                `Model "${modelSpec}" not found. Use /workflows-models to choose an available model.`)
+              : `tier "${options.tier}" from model-tiers.json resolves to "${modelSpec}", which is not available. Use /workflows-models to choose an available model.`;
           throw new WorkflowError(message, WorkflowErrorCode.MODEL_NOT_FOUND, {
             recoverable: false,
             agentLabel: options.label,
@@ -840,21 +1043,33 @@ export class WorkflowAgent {
         }
       } else {
         resolvedModel = resolved.model;
-        resolvedThinkingLevel = resolved.thinkingLevel;
-        options.onModelResolved?.(resolved.resolvedSpec ?? canonicalModelSpec(resolved.model));
+        resolvedThinkingLevel = resolved.thinkingLevel ?? options.thinking;
+        options.onModelResolved?.(
+          resolved.thinkingLevel !== undefined || options.thinking === undefined
+            ? (resolved.resolvedSpec ?? canonicalModelSpec(resolved.model))
+            : formatModelSpecWithThinking(
+                resolved.resolvedSpec ?? canonicalModelSpec(resolved.model),
+                options.thinking,
+              ),
+        );
       }
     }
+    resolvedThinkingLevel ??= options.thinking;
 
     const agentDir = getAgentDir();
-    // The runtime behind the resolved registry, handed to the subagent session
-    // below so it shares the host session's exact catalog and auth.
-    const modelRuntime = runtimeOf(modelRegistry);
     // Key persisted sessions by the runner's project cwd (this.cwd), NOT the
     // per-call runCwd: agents working in short-lived git worktrees should still
     // group under the project's session dir instead of scattering across
     // temporary worktree paths.
-    const sessionManager = this.createSessionManager(options.thread);
+    const sessionManager = this.createSessionManager(options.thread, runCwd);
     const threadLeaf = options.thread ? sessionManager.getLeafId() : null;
+    // Host split: pi >= 0.80.8 createAgentSession takes modelRuntime, not a
+    // registry — hand over the registry's backing runtime so subagents share
+    // the host catalog and auth. omp's fork is auth-storage-backed (registry
+    // has no `.runtime`; it takes modelRegistry instead). Never spread
+    // `modelRuntime: undefined` — it would shadow createAgentSession's own
+    // default runtime.
+    const modelRuntime = runtimeOf(modelRegistry) as ModelRuntime | undefined;
     let session: Awaited<ReturnType<typeof createAgentSession>>["session"];
     try {
       ({ session } = await createAgentSession({
@@ -865,20 +1080,31 @@ export class WorkflowAgent {
         // SettingsManager.inMemory() doesn't load ~/.pi/settings.json, so subagents
         // would fall back to the first available model (e.g. openai-codex) which may
         // not have valid auth, causing silent empty responses.
-        settingsManager: SettingsManager.create(this.cwd, agentDir),
+        settingsManager: SettingsManager.create(runCwd, agentDir),
         customTools,
         // Shared per-run loader with no host extensions (#109) — see
         // getSharedResourceLoader. An injected resourceLoader (tests / embedders)
         // wins and skips the shared build entirely; the ...this.sessionOptions
         // spread below re-applies the same injected value harmlessly.
-        resourceLoader: this.sessionOptions.resourceLoader ?? (await this.getSharedResourceLoader(agentDir)),
-        // Share the resolved registry's ModelRuntime (catalog + auth, including
-        // extension-registered providers) with the subagent session. pi >= 0.80.8
-        // takes modelRuntime here; the old modelRegistry option is gone.
-        ...(modelRuntime ? { modelRuntime } : {}),
+        resourceLoader: this.sessionOptions.resourceLoader ?? (await this.getSharedResourceLoader(agentDir, runCwd)),
+        // Host split (see modelRuntime above): stock pi takes modelRuntime;
+        // omp's fork takes modelRegistry. Spread-cast keeps the runtime value
+        // while satisfying the upstream CreateAgentSessionOptions type.
+        ...(modelRuntime ? { modelRuntime } : { modelRegistry }),
         ...this.sessionOptions,
-        // Named threads must retain their own manager even when an embedder supplied
-        // a default manager for ordinary one-shot calls.
+        ...(options.cwd !== undefined ? { cwd: runCwd } : {}),
+        // The computed AgentRegistry id must win over any injected
+        // sessionOptions value: a stable embedder-supplied agentId would
+        // collide across runs in the process-global registry. `agentId` is
+        // omp-fork-only (absent from upstream 0.83 types this package builds
+        // against); spread-cast keeps the runtime value while satisfying the
+        // upstream CreateAgentSessionOptions type.
+        ...{ agentId: this.agentIdFor(options, runCwd) },
+        // Named threads must retain their own manager even when an embedder
+        // supplied a default manager for ordinary one-shot calls — the
+        // sessionOptions spread above would otherwise overwrite the cached
+        // thread manager with the injected one, breaking turn continuity and
+        // failed-turn rollback.
         ...(options.thread ? { sessionManager } : {}),
         // Per-call model/thinking wins over any sessionOptions defaults.
         ...(resolvedModel ? { model: resolvedModel } : {}),
@@ -892,6 +1118,7 @@ export class WorkflowAgent {
       if (options.thread) this.restoreThreadLeaf(sessionManager, threadLeaf);
       throw error;
     }
+    pinChildCacheRetention(session.agent);
     const usageBeforeTurn = options.thread ? session.getSessionStats() : undefined;
     // This turn's own transcript, collected from message_end events below rather
     // than sliced out of session.messages with a pre-prompt() length snapshot.
@@ -925,6 +1152,9 @@ export class WorkflowAgent {
     let removeTurnListener: (() => void) | undefined;
     let lastHistoryEmit = 0;
     let threadTurnSucceeded = false;
+    let removeSessionListener: (() => void) | undefined;
+    let lastUsageProgressEmit = 0;
+    let lastProgressUsage: AgentUsage | undefined;
     const emitHistory = () => options.onHistory?.(compactAgentHistory(session.messages));
     const maybeEmitHistory = () => {
       if (!options.onHistory) return;
@@ -933,6 +1163,37 @@ export class WorkflowAgent {
       lastHistoryEmit = now;
       emitHistory();
     };
+    const emitUsageProgress = (event: AgentSessionEvent) => {
+      if (!options.onUsageProgress) {
+        return;
+      }
+      const now = Date.now();
+      if (
+        event.type === "message_update" &&
+        lastProgressUsage &&
+        now - lastUsageProgressEmit < LIVE_USAGE_EMIT_INTERVAL_MS
+      ) {
+        return;
+      }
+      const usage = usageFromSessionProgress(
+        subtractSessionUsageStats(session.getSessionStats(), usageBeforeTurn),
+        event,
+      );
+      if (!usage || (lastProgressUsage && agentUsageEquals(lastProgressUsage, usage))) {
+        return;
+      }
+      lastUsageProgressEmit = now;
+      lastProgressUsage = usage;
+      options.onUsageProgress(usage);
+    };
+    const emitSessionProgress = (event: AgentSessionEvent) => {
+      maybeEmitHistory();
+      try {
+        emitUsageProgress(event);
+      } catch {
+        // Usage progress is best-effort; never let stats failure interrupt the agent.
+      }
+    };
     try {
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
       if (options.signal) {
@@ -940,8 +1201,8 @@ export class WorkflowAgent {
         options.signal.addEventListener("abort", onAbort, { once: true });
         removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
       }
-      if (options.onHistory) {
-        removeHistoryListener = session.subscribe(() => maybeEmitHistory());
+      if (options.onHistory || options.onUsageProgress) {
+        removeSessionListener = session.subscribe(emitSessionProgress);
       }
       removeTurnListener = session.subscribe((event) => {
         if (event.type === "message_end") turnMessages.push(event.message);
@@ -984,6 +1245,7 @@ export class WorkflowAgent {
       removeAbortListener?.();
       removeHistoryListener?.();
       removeTurnListener?.();
+      removeSessionListener?.();
       try {
         emitHistory();
       } catch {
@@ -996,20 +1258,7 @@ export class WorkflowAgent {
       if (options.onUsage) {
         try {
           const stats = session.getSessionStats();
-          const usage = usageFromStats(
-            usageBeforeTurn
-              ? {
-                  tokens: {
-                    input: Math.max(0, stats.tokens.input - usageBeforeTurn.tokens.input),
-                    output: Math.max(0, stats.tokens.output - usageBeforeTurn.tokens.output),
-                    cacheRead: Math.max(0, stats.tokens.cacheRead - usageBeforeTurn.tokens.cacheRead),
-                    cacheWrite: Math.max(0, stats.tokens.cacheWrite - usageBeforeTurn.tokens.cacheWrite),
-                    total: Math.max(0, stats.tokens.total - usageBeforeTurn.tokens.total),
-                  },
-                  cost: Math.max(0, stats.cost - usageBeforeTurn.cost),
-                }
-              : stats,
-          );
+          const usage = usageFromStats(subtractSessionUsageStats(stats, usageBeforeTurn));
           if (usage) options.onUsage(usage);
         } catch {
           // Usage is best-effort; never let stats failure mask the real result/error.

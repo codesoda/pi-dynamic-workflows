@@ -27,20 +27,50 @@ function fakeAgent(usage: Partial<AgentUsage> = {}, result: unknown = "ok") {
   };
 }
 
-/** Agent that stays running until a deferred resolve is called externally. */
+/** Agent that stays running until resolved externally or its attempt is aborted. */
 function deferredAgent() {
-  let deferredResolve: ((value: unknown) => void) | null = null;
-  let deferredReject: ((err: Error) => void) | null = null;
-  const promise = new Promise((resolve, reject) => {
-    deferredResolve = resolve;
-    deferredReject = reject;
-  });
+  interface PendingAttempt {
+    resolve: (value: unknown) => void;
+    reject: (error: Error) => void;
+    signal?: AbortSignal;
+    onAbort: () => void;
+  }
+
+  const pendingAttempts = new Set<PendingAttempt>();
+  const settleAttempt = (attempt: PendingAttempt, settle: () => void) => {
+    attempt.signal?.removeEventListener("abort", attempt.onAbort);
+    pendingAttempts.delete(attempt);
+    settle();
+  };
   return {
-    resolve: (value: unknown = "done") => deferredResolve?.(value),
-    reject: (err: Error) => deferredReject?.(err),
+    resolve: (value: unknown = "done") => {
+      for (const attempt of [...pendingAttempts]) {
+        settleAttempt(attempt, () => attempt.resolve(value));
+      }
+    },
+    reject: (error: Error) => {
+      for (const attempt of [...pendingAttempts]) {
+        settleAttempt(attempt, () => attempt.reject(error));
+      }
+    },
     runner: {
-      async run(_prompt: string, _options?: { onUsage?: (u: AgentUsage) => void }) {
-        return promise;
+      async run(prompt: string, options?: { onUsage?: (usage: AgentUsage) => void; signal?: AbortSignal }) {
+        void prompt;
+        return new Promise((resolve, reject) => {
+          const attempt: PendingAttempt = {
+            resolve,
+            reject,
+            signal: options?.signal,
+            onAbort: () => {},
+          };
+          attempt.onAbort = () => settleAttempt(attempt, () => reject(new Error("deferred agent aborted")));
+          pendingAttempts.add(attempt);
+          if (attempt.signal?.aborted) {
+            attempt.onAbort();
+          } else {
+            attempt.signal?.addEventListener("abort", attempt.onAbort, { once: true });
+          }
+        });
       },
     },
   };
@@ -139,6 +169,418 @@ test(
     assert.equal(runs[0].workflowName, "tracked_demo");
     assert.equal(runs[0].status, "completed");
     assert.equal(runs[0].tokenUsage?.total, 140, "token usage is persisted for the navigator");
+  }),
+);
+
+test(
+  "manager replaces a high live estimate with settled agent usage",
+  withTempCwd(async (cwd) => {
+    let release: (() => void) | undefined;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          void prompt;
+          options?.onUsageProgress?.({
+            input: 20,
+            output: 80,
+            total: 100,
+            cost: 0.01,
+            cacheRead: 0,
+            cacheWrite: 0,
+          });
+          await blocked;
+          options?.onUsage?.({
+            input: 20,
+            output: 10,
+            total: 30,
+            cost: 0.01,
+            cacheRead: 0,
+            cacheWrite: 0,
+          });
+          return "done";
+        },
+      },
+    });
+
+    let tokenUsageEvents = 0;
+    manager.on("tokenUsage", () => {
+      tokenUsageEvents++;
+    });
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    while ((manager.getRun(runId)?.snapshot.agents[0]?.tokens ?? 0) < 100) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    const live = manager.getRun(runId);
+    assert.equal(live?.status, "running");
+    assert.equal(live?.snapshot.agents[0]?.status, "running");
+    assert.equal(live?.snapshot.agents[0]?.tokens, 100);
+    assert.equal(live?.snapshot.tokenUsage, undefined, "in-flight estimates must not alter finalized run accounting");
+    assert.ok(tokenUsageEvents > 0, "live task-panel listeners should be notified before agent completion");
+
+    assert.ok(release);
+    release();
+    await promise;
+    const settled = manager.getRun(runId);
+    assert.equal(settled?.snapshot.agents[0]?.tokens, 30);
+    assert.equal(settled?.snapshot.agents[0]?.tokenUsage?.total, 30);
+    assert.equal(settled?.snapshot.tokenUsage?.total, 30);
+  }),
+);
+
+test(
+  "manager persists exact terminal usage from an aborted attempt",
+  withTempCwd(async (cwd) => {
+    const exactUsage = { input: 20, output: 5, total: 25, cost: 0.1, cacheRead: 0, cacheWrite: 0 };
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          void prompt;
+          await new Promise<void>((resolve, reject) => {
+            void resolve;
+            const abort = () => {
+              options?.onUsage?.(exactUsage);
+              reject(new Error("aborted after exact usage"));
+            };
+            if (options?.signal?.aborted) {
+              abort();
+            } else {
+              options?.signal?.addEventListener("abort", abort, { once: true });
+            }
+          });
+          return "unreachable";
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    while (manager.getRun(runId)?.snapshot.agents.length !== 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    assert.equal(manager.pause(runId), true);
+    await assert.rejects(promise);
+
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.status, "paused");
+    assert.equal(persisted?.tokenUsage?.total, 25);
+    assert.equal(persisted?.tokenUsage?.cost, 0.1);
+  }),
+);
+
+test(
+  "manual pause settles with exact abort usage and never emits 'error'",
+  withTempCwd(async (cwd) => {
+    const exactUsage: AgentUsage = {
+      input: 20,
+      output: 5,
+      total: 25,
+      cost: 0.1,
+      cacheRead: 0,
+      cacheWrite: 0,
+    };
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          void prompt;
+          return new Promise((resolve, reject) => {
+            void resolve;
+            options?.signal?.addEventListener(
+              "abort",
+              () => {
+                setTimeout(() => {
+                  options.onUsage?.(exactUsage);
+                  reject(new Error("aborted after exact usage"));
+                }, 20);
+              },
+              { once: true },
+            );
+          });
+        },
+      },
+    });
+    manager.on("error", () => {});
+    // pause() announces "paused" synchronously (lifecycle control); the exact
+    // abort-teardown usage lands later, when executeRun() settles and persists.
+    let errorEvents = 0;
+    manager.on("error", () => {
+      errorEvents++;
+    });
+
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    while (manager.getRun(runId)?.snapshot.agents.length !== 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    assert.equal(manager.pause(runId), true);
+    await assert.rejects(promise);
+
+    const settled = manager.getPersistence().load(runId);
+    assert.equal(settled?.status, "paused");
+    assert.equal(settled?.tokenUsage?.total, 25);
+    assert.equal(settled?.tokenUsage?.cost, 0.1);
+    assert.equal(errorEvents, 0, "a manual pause must not surface as an error");
+  }),
+);
+
+test(
+  "immediate resume waits for paused execution usage to settle",
+  withTempCwd(async (cwd) => {
+    let markFirstAttemptStarted: () => void = () => {};
+    const firstAttemptStarted = new Promise<void>((resolve) => {
+      markFirstAttemptStarted = resolve;
+    });
+    let attempts = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          void prompt;
+          attempts++;
+          if (attempts === 1) {
+            markFirstAttemptStarted();
+            await new Promise<void>((resolve, reject) => {
+              void resolve;
+              options?.signal?.addEventListener(
+                "abort",
+                () => {
+                  setTimeout(() => {
+                    options.onUsage?.({
+                      input: 20,
+                      output: 5,
+                      total: 25,
+                      cost: 0.1,
+                      cacheRead: 0,
+                      cacheWrite: 0,
+                    });
+                    reject(new Error("first attempt aborted"));
+                  }, 20);
+                },
+                { once: true },
+              );
+            });
+          }
+          options?.onUsage?.({ input: 8, output: 2, total: 10, cost: 0.01, cacheRead: 0, cacheWrite: 0 });
+          return "resumed";
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    promise.catch(() => {});
+    await firstAttemptStarted;
+    assert.equal(manager.pause(runId), true);
+    assert.equal(await manager.resume(runId), true);
+    while (manager.getRun(runId)?.status === "running") {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.status, "completed");
+    assert.equal(persisted?.tokenUsage?.total, 35);
+    assert.equal(attempts, 2);
+  }),
+);
+
+test(
+  "resume refuses to overlap pause teardown that exceeds the settlement grace period",
+  withTempCwd(async (cwd) => {
+    let markFirstAttemptStarted: () => void = () => {};
+    const firstAttemptStarted = new Promise<void>((resolve) => {
+      markFirstAttemptStarted = resolve;
+    });
+    let attempts = 0;
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          void prompt;
+          attempts++;
+          if (attempts === 1) {
+            markFirstAttemptStarted();
+            return new Promise((resolve, reject) => {
+              void resolve;
+              options?.signal?.addEventListener(
+                "abort",
+                () => {
+                  setTimeout(() => {
+                    options.onUsage?.({
+                      input: 20,
+                      output: 5,
+                      total: 25,
+                      cost: 0.1,
+                      cacheRead: 0,
+                      cacheWrite: 0,
+                    });
+                    reject(new Error("first attempt finished slow abort teardown"));
+                  }, 1_100);
+                },
+                { once: true },
+              );
+            });
+          }
+          options?.onUsage?.({ input: 8, output: 2, total: 10, cost: 0.01, cacheRead: 0, cacheWrite: 0 });
+          return "resumed";
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    await firstAttemptStarted;
+    assert.equal(manager.pause(runId), true);
+    assert.equal(await manager.resume(runId), false, "resume must not overlap an execution still tearing down");
+    assert.equal(attempts, 1, "no replacement agent may start before pause teardown settles");
+    await assert.rejects(promise);
+
+    const paused = manager.getPersistence().load(runId);
+    assert.equal(paused?.tokenUsage?.total, 25);
+    assert.equal(await manager.resume(runId), true);
+    while (manager.getRun(runId)?.status === "running") {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    const completed = manager.getPersistence().load(runId);
+    assert.equal(completed?.status, "completed");
+    assert.equal(completed?.tokenUsage?.total, 35);
+    assert.equal(attempts, 2);
+  }),
+);
+
+test(
+  "manager attributes concurrent same-label usage by call identity",
+  withTempCwd(async (cwd) => {
+    let started = 0;
+    let releaseBothStarted: () => void = () => {};
+    const bothStarted = new Promise<void>((resolve) => {
+      releaseBothStarted = resolve;
+    });
+    let releaseAgents: () => void = () => {};
+    const agentsReleased = new Promise<void>((resolve) => {
+      releaseAgents = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          started++;
+          if (started === 2) {
+            releaseBothStarted();
+          }
+          await bothStarted;
+          const total = prompt === "first" ? 10 : 100;
+          options?.onUsageProgress?.({
+            input: 0,
+            output: total,
+            total,
+            cost: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+          });
+          await agentsReleased;
+          return prompt;
+        },
+      },
+    });
+    const script = `export const meta = { name: 'same_label', description: 'same labels in parallel' }
+const results = await parallel([
+  () => agent('first', { label: 'worker' }),
+  () => agent('second', { label: 'worker' }),
+])
+return results`;
+
+    const { runId, promise } = manager.startInBackground(script);
+    while (true) {
+      const liveAgents = manager.getRun(runId)?.snapshot.agents;
+      if (liveAgents?.length === 2 && liveAgents.every((agent) => agent.tokens !== undefined)) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    const agents = manager.getRun(runId)?.snapshot.agents;
+    assert.deepEqual(
+      agents?.map((agent) => [agent.prompt, agent.tokens]),
+      [
+        ["first", 10],
+        ["second", 100],
+      ],
+    );
+
+    releaseAgents();
+    await promise;
+  }),
+);
+
+test(
+  "manager attributes concurrent parent and nested agents by opaque agent identity",
+  withTempCwd(async (cwd) => {
+    let started = 0;
+    let releaseBothStarted: () => void = () => {};
+    const bothStarted = new Promise<void>((resolve) => {
+      releaseBothStarted = resolve;
+    });
+    let releaseAgents: () => void = () => {};
+    const agentsReleased = new Promise<void>((resolve) => {
+      releaseAgents = resolve;
+    });
+    const childScript = `export const meta = { name: 'child', description: 'nested child' }
+return await agent('child work', { label: 'worker' })`;
+    const manager = new WorkflowManager({
+      cwd,
+      loadSavedWorkflow: (name) => (name === "child" ? childScript : undefined),
+      agent: {
+        async run(prompt, options) {
+          started++;
+          if (started === 2) {
+            releaseBothStarted();
+          }
+          await bothStarted;
+          const total = prompt === "parent work" ? 10 : 100;
+          const usage = { input: 0, output: total, total, cost: 0, cacheRead: 0, cacheWrite: 0 };
+          options?.onUsageProgress?.(usage);
+          await agentsReleased;
+          options?.onUsage?.(usage);
+          return prompt;
+        },
+      },
+    });
+    const parentScript = `export const meta = { name: 'parent', description: 'parent and nested child' }
+const results = await parallel([
+  () => agent('parent work', { label: 'worker' }),
+  () => workflow('child'),
+])
+return results`;
+
+    const { runId, promise } = manager.startInBackground(parentScript);
+    while (true) {
+      const agents = manager.getRun(runId)?.snapshot.agents;
+      if (agents?.length === 2 && agents.every((agent) => agent.tokens !== undefined)) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    assert.deepEqual(
+      manager.getRun(runId)?.snapshot.agents.map((agent) => [agent.prompt, agent.tokens]),
+      [
+        ["parent work", 10],
+        ["child work", 100],
+      ],
+    );
+
+    releaseAgents();
+    await promise;
+    assert.equal(
+      manager.getRun(runId)?.snapshot.agents.every((agent) => agent.status === "done"),
+      true,
+    );
+    assert.equal(manager.getRun(runId)?.snapshot.tokenUsage?.total, 110);
   }),
 );
 
@@ -263,9 +705,14 @@ test(
     // which point attempt 2 resolves immediately.
     let secondAttempts = 0;
     const agent = {
-      async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void }) {
+      async run(prompt: string, options?: { onUsage?: (usage: AgentUsage) => void; signal?: AbortSignal }) {
         options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 100, cost: 0 });
-        if (prompt === "second" && ++secondAttempts === 1) return new Promise(() => {});
+        if (prompt === "second" && ++secondAttempts === 1) {
+          return new Promise((resolve, reject) => {
+            void resolve;
+            options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+          });
+        }
         return "ok";
       },
     };
@@ -540,13 +987,18 @@ test(
     let secondAttempts = 0;
     const zeroUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
     const agent = {
-      async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void }) {
+      async run(prompt: string, options?: { onUsage?: (usage: AgentUsage) => void; signal?: AbortSignal }) {
         if (prompt === "first") {
           options?.onUsage?.({ ...zeroUsage, total: 100 });
           return "first-result";
         }
         if (prompt === "second") {
-          if (++secondAttempts === 1) return new Promise(() => {}); // hang until paused
+          if (++secondAttempts === 1) {
+            return new Promise((resolve, reject) => {
+              void resolve;
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused")), { once: true });
+            });
+          }
           options?.onUsage?.({ ...zeroUsage, total: 60 });
           return "second-result";
         }
@@ -596,12 +1048,8 @@ test(
   withTempCwd(async (cwd) => {
     // 'a's first attempt spends 40 tokens then fails with an empty output
     // (recoverable -> retried); its second attempt spends 25 more and
-    // succeeds. onAgentEnd only ever reports the FINAL attempt's tokens (25)
-    // — the first attempt's 40 would be invisible to a persisted total built
-    // purely from onAgentEnd. 'b' then hangs so we can pause() and inspect
-    // the persisted state BEFORE the run fully completes (a full completion
-    // would paper over the gap via workflow.ts's own final onTokenUsage,
-    // which always includes every attempt's spend regardless of this fix).
+    // succeeds. Live usage must preserve both attempts before 'b' hangs and
+    // we pause, rather than waiting for workflow.ts's final onTokenUsage.
     let aAttempts = 0;
     const agent = {
       async run(prompt: string, options?: { onUsage?: (u: AgentUsage) => void }) {
@@ -732,6 +1180,46 @@ return { a, b }`;
 );
 
 test(
+  "the live snapshot shows a running agent's REAL model, corrected before it finishes",
+  withTempCwd(async (cwd) => {
+    const holder: { manager?: WorkflowManager; runId?: string } = {};
+    /** Reads back what /workflows would display while this very agent is still running. */
+    let modelWhileRunning: string | undefined;
+    const resolvingAgent = {
+      async run(_prompt: string, options: { onModelResolved?: (id: string) => void }) {
+        options.onModelResolved?.("tier-prov/tier-model");
+        // Read the LIVE in-memory snapshot — exactly what the panel and the
+        // navigator render from — while this agent is still inside run().
+        const snapshot = holder.runId ? holder.manager?.getRun(holder.runId)?.snapshot : undefined;
+        modelWhileRunning = snapshot?.agents.find((a) => a.label === "a")?.model;
+        return "ok";
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent: resolvingAgent, mainModel: "main-prov/main-model" });
+    holder.manager = manager;
+    manager.on("agentStart", (e: { runId: string }) => {
+      holder.runId = e.runId;
+    });
+
+    const events: Array<{ agentId?: number; model?: string }> = [];
+    manager.on("agentModel", (e: { agentId?: number; model?: string }) => events.push(e));
+
+    const result = await manager.runSync(oneAgentScript);
+
+    assert.equal(
+      modelWhileRunning,
+      "tier-prov/tier-model",
+      "an in-flight agent must not display the session's main model once its own is known",
+    );
+    assert.equal(events.length, 1, "the correction is broadcast live for panel repaints");
+    assert.equal(events[0]?.agentId, 1, "keyed to the agent row the panel already created");
+    assert.equal(events[0]?.model, "tier-prov/tier-model");
+    const persisted = manager.getPersistence().load(result.runId);
+    assert.equal(persisted?.agents.find((a) => a.label === "a")?.model, "tier-prov/tier-model");
+  }),
+);
+
+test(
   "runSync persists recoverable agent error details for /workflows",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({
@@ -846,8 +1334,13 @@ test(
   "startInBackground returns immediately with runId and promise",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    let startedRunId = "";
+    manager.on("started", ({ runId }: { runId: string }) => {
+      startedRunId = runId;
+    });
     const { runId, promise } = manager.startInBackground(oneAgentScript);
     assert.ok(runId, "should generate a run id");
+    assert.equal(startedRunId, runId, "should emit started after the run is persisted");
     assert.ok(promise instanceof Promise, "should return a promise");
     const runs = manager.listRuns();
     assert.equal(runs.length, 1);
@@ -1330,12 +1823,10 @@ test(
     const { runId, promise } = manager.startInBackground(oneAgentScript);
     await new Promise((r) => setTimeout(r, 20));
     manager.pause(runId);
-
-    assert.ok(pausedEvent, "paused event should fire");
-    assert.equal(pausedEvent?.runId, runId);
-
-    da.resolve("done");
     await promise.catch(() => {});
+
+    assert.ok(pausedEvent, "paused event should fire after the paused execution settles");
+    assert.equal(pausedEvent?.runId, runId);
   }),
 );
 
@@ -1454,6 +1945,10 @@ return { a, b }`;
       // Resume
       const resumed = await manager.resume(runId);
       assert.equal(resumed, true);
+      while ((manager.getRun(runId)?.snapshot.agents.length ?? 0) < 2) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      da.resolve("second-result");
 
       // Wait for resumed run to complete (agent 1 replayed from journal, agent 2 live)
       await new Promise((r) => setTimeout(r, 50));
@@ -1464,6 +1959,142 @@ return { a, b }`;
     }
 
     await origPromise.catch(() => {});
+  }),
+);
+
+test(
+  "resume replays parent and nested journals without duplicate token spend",
+  withTempCwd(async (cwd) => {
+    let parentRuns = 0;
+    let childRuns = 0;
+    let afterRuns = 0;
+    let markAfterStarted: () => void = () => {};
+    const afterStarted = new Promise<void>((resolve) => {
+      markAfterStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      loadSavedWorkflow: (name) =>
+        name === "child"
+          ? `export const meta = { name: 'child', description: 'nested child' }
+return await agent('child', { label: 'child' })`
+          : undefined,
+      agent: {
+        async run(prompt, options) {
+          if (prompt === "parent") {
+            parentRuns++;
+            options?.onUsage?.({ input: 8, output: 2, total: 10, cost: 0.01, cacheRead: 0, cacheWrite: 0 });
+            return "parent-result";
+          }
+          if (prompt === "child") {
+            childRuns++;
+            options?.onUsage?.({ input: 30, output: 10, total: 40, cost: 0.04, cacheRead: 0, cacheWrite: 0 });
+            return "child-result";
+          }
+          afterRuns++;
+          if (afterRuns === 1) {
+            markAfterStarted();
+            return new Promise((resolve, reject) => {
+              void resolve;
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused after nested work")), {
+                once: true,
+              });
+            });
+          }
+          options?.onUsage?.({ input: 4, output: 1, total: 5, cost: 0.005, cacheRead: 0, cacheWrite: 0 });
+          return "after-result";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'nested_resume', description: 'nested journal resume' }
+const parent = await agent('parent', { label: 'parent' })
+const child = await workflow('child')
+const after = await agent('after', { label: 'after' })
+return { parent, child, after }`;
+
+    const { runId, promise } = manager.startInBackground(script);
+    await afterStarted;
+    assert.equal(manager.pause(runId), true);
+    await assert.rejects(promise);
+    assert.equal(manager.getPersistence().load(runId)?.tokenUsage?.total, 50);
+
+    assert.equal(await manager.resume(runId), true);
+    while (manager.getRun(runId)?.status === "running") {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    const completed = manager.getPersistence().load(runId);
+    assert.equal(completed?.status, "completed");
+    assert.equal(completed?.tokenUsage?.total, 55);
+    assert.equal(parentRuns, 1);
+    assert.equal(childRuns, 1);
+    assert.equal(afterRuns, 2);
+  }),
+);
+
+test(
+  "edited parent call invalidates nested and suffix journal replay",
+  withTempCwd(async (cwd) => {
+    const runs = { parent: 0, child: 0, after: 0 };
+    let markAfterStarted: () => void = () => {};
+    const afterStarted = new Promise<void>((resolve) => {
+      markAfterStarted = resolve;
+    });
+    const manager = new WorkflowManager({
+      cwd,
+      loadSavedWorkflow: () => `export const meta = { name: 'child', description: 'nested child' }
+return await agent('child', { label: 'child' })`,
+      agent: {
+        async run(prompt, options) {
+          if (prompt.startsWith("parent")) {
+            runs.parent++;
+            options?.onUsage?.({ input: 8, output: 2, total: 10, cost: 0.01, cacheRead: 0, cacheWrite: 0 });
+            return prompt;
+          }
+          if (prompt === "child") {
+            runs.child++;
+            options?.onUsage?.({ input: 30, output: 10, total: 40, cost: 0.04, cacheRead: 0, cacheWrite: 0 });
+            return "child-result";
+          }
+          runs.after++;
+          if (runs.after === 1) {
+            markAfterStarted();
+            return new Promise((resolve, reject) => {
+              void resolve;
+              options?.signal?.addEventListener("abort", () => reject(new Error("paused after nested work")), {
+                once: true,
+              });
+            });
+          }
+          options?.onUsage?.({ input: 4, output: 1, total: 5, cost: 0.005, cacheRead: 0, cacheWrite: 0 });
+          return "after-result";
+        },
+      },
+    });
+    manager.on("error", () => {});
+    const script = (
+      parentPrompt: string,
+    ) => `export const meta = { name: 'nested_edit', description: 'nested edit resume' }
+const parent = await agent('${parentPrompt}', { label: 'parent' })
+const child = await workflow('child')
+const after = await agent('after', { label: 'after' })
+return { parent, child, after }`;
+
+    const { runId, promise } = manager.startInBackground(script("parent"));
+    await afterStarted;
+    assert.equal(manager.pause(runId), true);
+    await assert.rejects(promise);
+    assert.equal(manager.getPersistence().load(runId)?.tokenUsage?.total, 50);
+
+    assert.equal(await manager.resume(runId, { script: script("parent-edited") }), true);
+    while (manager.getRun(runId)?.status === "running") {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    const completed = manager.getPersistence().load(runId);
+    assert.equal(completed?.tokenUsage?.total, 105);
+    assert.deepEqual(runs, { parent: 2, child: 2, after: 2 });
   }),
 );
 
@@ -1636,9 +2267,34 @@ test(
     const agentA = persisted?.agents.find((a) => a.label === "a");
     assert.equal(agentA?.status, "done", "the already-completed agent's state is flushed synchronously too");
     assert.ok(agentA?.endedAt, "flushed agent state carries its real endedAt, not stale/missing data");
+    const agentB = persisted?.agents.find((a) => a.label === "b");
+    assert.equal(agentB?.status, "running", "pause is resumable and must not skip in-flight agents");
+    assert.equal(agentB?.endedAt, undefined);
+    assert.equal(persisted?.error, undefined);
 
     // 'second' never resolves on its own; don't await it, just avoid an unhandled rejection.
     promise.catch(() => {});
+  }),
+);
+
+test(
+  "pause drain persist skips leftover agents once the execution has settled",
+  withTempCwd(async (cwd) => {
+    const da = deferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: da.runner });
+    manager.on("error", () => {});
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    for (let i = 0; i < 200 && manager.getRun(runId)?.snapshot.agents[0]?.status !== "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(manager.pause(runId), true);
+    await promise.catch(() => {});
+
+    const persisted = manager.listRuns().find((r) => r.runId === runId);
+    assert.equal(persisted?.status, "paused");
+    assert.equal(persisted?.agents[0]?.status, "skipped");
+    assert.equal(persisted?.agents[0]?.error, "interrupted");
+    assert.ok(persisted?.agents[0]?.endedAt);
   }),
 );
 
@@ -1662,9 +2318,59 @@ test(
     const agentA = persisted?.agents.find((a) => a.label === "a");
     assert.equal(agentA?.status, "done");
     assert.ok(agentA?.endedAt, "flushed agent state carries its real endedAt, not stale/missing data");
+    const agentB = persisted?.agents.find((a) => a.label === "b");
+    assert.equal(agentB?.status, "skipped", "in-flight agents must not stay running on an aborted persist");
+    assert.equal(agentB?.error, "aborted");
+    assert.equal(agentB?.errorCode, WorkflowErrorCode.WORKFLOW_ABORTED);
+    assert.ok(agentB?.endedAt, "skipped leftover agents get endedAt from the terminal persist");
+    assert.equal(persisted?.error, "workflow aborted");
+    assert.equal(persisted?.errorCode, WorkflowErrorCode.WORKFLOW_ABORTED);
+    assert.ok(persisted?.completedAt, "aborted runs record a completion timestamp");
+    assert.ok((persisted?.durationMs ?? 0) >= 0);
 
     // 'second' never resolves on its own; don't await it, just avoid an unhandled rejection.
     promise.catch(() => {});
+  }),
+);
+
+test(
+  "failed persist settles leftover running siblings and records the cause",
+  withTempCwd(async (cwd) => {
+    const agent = {
+      async run(prompt: string, options?: { signal?: AbortSignal }) {
+        if (prompt === "failer") {
+          throw new WorkflowError("boom", WorkflowErrorCode.AGENT_EXECUTION_ERROR, { recoverable: false });
+        }
+        return new Promise((_resolve, reject) => {
+          const onAbort = () => reject(new Error("deferred agent aborted"));
+          if (options?.signal?.aborted) onAbort();
+          else options?.signal?.addEventListener("abort", onAbort, { once: true });
+        });
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent });
+    manager.on("error", () => {});
+    const script = `export const meta = { name: 'fail_sibling', description: 'fail with in-flight sibling' }
+const xs = await parallel([
+  () => agent('failer', { label: 'failer' }),
+  () => agent('hang', { label: 'hang' }),
+])
+return xs`;
+    const { runId, promise } = manager.startInBackground(script);
+    await promise.catch(() => {});
+
+    const persisted = manager.listRuns().find((r) => r.runId === runId);
+    assert.equal(persisted?.status, "failed");
+    assert.match(persisted?.error ?? "", /boom/);
+    assert.equal(persisted?.errorCode, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+    const failer = persisted?.agents.find((a) => a.label === "failer");
+    const hang = persisted?.agents.find((a) => a.label === "hang");
+    assert.equal(failer?.status, "error");
+    assert.equal(hang?.status, "skipped", "run-fatal abort must not leave siblings running on disk");
+    assert.equal(hang?.error, "boom", "leftover agents carry the run's failure cause");
+    assert.equal(hang?.errorCode, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+    assert.ok(hang?.endedAt);
+    assert.ok(persisted?.completedAt);
   }),
 );
 
@@ -1928,8 +2634,16 @@ test(
       args: undefined,
       status: "running",
       phases: [],
-      agents: [],
-      logs: [],
+      agents: [
+        {
+          id: 1,
+          label: "hang",
+          prompt: "do it",
+          status: "running",
+          startedAt: new Date().toISOString(),
+        },
+      ],
+      logs: ["still going"],
       startedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     });
@@ -1939,6 +2653,12 @@ test(
 
     const persisted = manager.listRuns().find((r) => r.runId === runId);
     assert.equal(persisted?.status, "aborted", "persisted status should become aborted");
+    assert.equal(persisted?.error, "workflow aborted");
+    assert.equal(persisted?.errorCode, WorkflowErrorCode.WORKFLOW_ABORTED);
+    assert.equal(persisted?.agents[0]?.status, "skipped");
+    assert.equal(persisted?.agents[0]?.error, "aborted");
+    assert.ok(persisted?.agents[0]?.endedAt);
+    assert.deepEqual(persisted?.logs, ["still going"], "cold-start stop must keep already-persisted logs");
   }),
 );
 
@@ -3670,12 +4390,73 @@ test(
     // the one evicted — proving stop() itself recorded it terminal-eligible
     // (without that, it would sit in `runs` forever: no pending tail left to
     // ever call recordTerminalRun() for it).
-    const other = await manager.runSync(oneAgentScript);
+    // The deferred-agent helper creates a per-attempt promise (aborted attempts
+    // reject rather than stay pending), so start the runSync first and resolve
+    // once its fresh attempt has registered.
+    const pendingSync = manager.runSync(oneAgentScript);
+    await new Promise((r) => setTimeout(r, 50));
+    da.resolve("done");
+    const other = await pendingSync;
     assert.ok(manager.getRun(other.runId), "the newest terminal run is in memory");
     assert.equal(
       manager.getRun(pausedId),
       undefined,
       "stop() must have recorded the already-settled paused run as terminal-eligible, so it's evicted here",
     );
+  }),
+);
+
+test(
+  "manager rolls back provisional agent usage when pause aborts without terminal usage",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({
+      cwd,
+      agent: {
+        async run(prompt, options) {
+          void prompt;
+          options?.onUsageProgress?.({
+            input: 20,
+            output: 80,
+            total: 100,
+            cost: 0.01,
+            cacheRead: 0,
+            cacheWrite: 0,
+          });
+          return new Promise((resolve, reject) => {
+            void resolve;
+            const abort = () => reject(new Error("aborted without terminal usage"));
+            if (options?.signal?.aborted) {
+              abort();
+            } else {
+              options?.signal?.addEventListener("abort", abort, { once: true });
+            }
+          });
+        },
+      },
+    });
+    manager.on("error", () => {});
+
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+    while ((manager.getRun(runId)?.snapshot.agents[0]?.tokens ?? 0) < 100) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    assert.equal(manager.pause(runId), true);
+    await assert.rejects(promise);
+
+    const live = manager.getRun(runId);
+    assert.equal(live?.status, "paused");
+    assert.equal(live?.snapshot.agents[0]?.tokens, 0, "the in-memory agent must discard provisional usage");
+    assert.equal(live?.snapshot.agents[0]?.tokenUsage?.total, 0);
+    assert.equal(live?.snapshot.tokenUsage, undefined, "abandoned usage must not enter run accounting");
+
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(persisted?.status, "paused");
+    assert.equal(persisted?.agents[0]?.tokens, 0, "the persisted agent must discard provisional usage");
+    assert.equal(persisted?.agents[0]?.tokenUsage?.total, 0);
+    assert.equal(persisted?.tokenUsage, undefined);
+
+    const statusRow = new NavigatorModel(manager).runs().find((run) => run.runId === runId);
+    assert.equal(statusRow?.fresh, 0, "status-facing usage must reflect committed usage only");
+    assert.equal(statusRow?.cacheRead, 0);
   }),
 );

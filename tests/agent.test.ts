@@ -1,24 +1,36 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import { ModelRegistry, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+import {
+  DefaultResourceLoader,
+  defineTool,
+  ModelRegistry,
+  ModelRuntime,
+  SessionManager,
+  SettingsManager,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
 import {
   DEFAULT_EXCLUDED_SUBAGENT_TOOLS,
   listAvailableModelSpecs,
   resolveAgentModelSpec,
+  runtimeOf,
   subagentExcludedTools,
   usageFromStats,
   WorkflowAgent,
 } from "../src/agent.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { resolveModelSpecWithThinking } from "../src/model-spec.js";
-import type { ModelTierConfig } from "../src/model-tier-config.js";
-import { runWorkflow } from "../src/workflow.js";
+import {
+  getModelTierConfigPath,
+  getProjectModelTierConfigPath,
+  type ModelTierConfig,
+} from "../src/model-tier-config.js";
+import { type JournalEntry, runWorkflow } from "../src/workflow.js";
 import { withFakeHome, withFakeHomeAsync } from "./helpers/fake-home.js";
 
 // Private methods used for testing - cast to this type to access them without `any`
@@ -26,7 +38,10 @@ type WorkflowAgentPrivates = {
   buildPrompt(prompt: string, options: AgentRunOptions<any>, structured: boolean): string;
   lastAssistantText(messages: unknown[]): string;
   finalAssistantText(messages: unknown[]): string;
-  createSessionManager(thread?: string): {
+  createSessionManager(
+    thread?: string,
+    cwd?: string,
+  ): {
     isPersisted(): boolean;
     getCwd(): string;
     getSessionId(): string;
@@ -36,7 +51,46 @@ type WorkflowAgentPrivates = {
     appendSessionInfo(name: string): string;
   };
   restoreThreadLeaf(manager: ReturnType<WorkflowAgentPrivates["createSessionManager"]>, leafId: string | null): void;
+  getRegistry(perRunRegistry?: ModelRegistry): Promise<ModelRegistry>;
 };
+
+async function fauxRegistry(
+  home: string,
+  provider: string,
+  core: ReturnType<typeof createFauxCore>,
+): Promise<ModelRegistry> {
+  const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+  runtime.registerProvider(provider, {
+    name: "Faux Test",
+    baseUrl: "http://127.0.0.1:9/faux",
+    apiKey: "faux-dummy-key-not-used",
+    api: core.api,
+    streamSimple: core.streamSimple as never,
+    models: core.models.map((model) => ({
+      id: model.id,
+      name: model.name ?? model.id,
+      reasoning: false,
+      input: ["text"] as ("text" | "image")[],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: model.contextWindow ?? 128000,
+      maxTokens: model.maxTokens ?? 4096,
+    })),
+  });
+  return new ModelRegistry(runtime);
+}
+
+function bashToolResultText(context: unknown): string {
+  const messages = (context as { messages?: Array<Record<string, unknown>> }).messages ?? [];
+  const result = messages.find((message) => message.role === "toolResult" && message.toolName === "bash");
+  assert.ok(result, "the follow-up request must contain the bash tool result");
+  const content = Array.isArray(result.content) ? result.content : [];
+  return content
+    .filter((block): block is { type: "text"; text: string } => {
+      return typeof block === "object" && block !== null && block.type === "text" && typeof block.text === "string";
+    })
+    .map((block) => block.text)
+    .join("\n");
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // persistAgentSessions — in-memory by default, file-backed keyed by project cwd
@@ -74,6 +128,45 @@ test("WorkflowAgent with persistAgentSessions=true creates a file-backed manager
   }
 });
 
+test("agentIdFor mints a unique id per unthreaded createAgentSession call (concurrent/retry-safe)", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  const id1 = agent.agentIdFor({}, "/worktree-a");
+  const id2 = agent.agentIdFor({}, "/worktree-b");
+  const id3 = agent.agentIdFor({}, "/worktree-a");
+  assert.notEqual(id1, id2, "distinct worktrees must never share an id");
+  assert.notEqual(id1, id3, "a retried call on the same worktree must not reuse the id");
+  // Each id embeds the pid + a monotonic per-process sequence, so ids from
+  // concurrent runs in this process can never collide either.
+  assert.match(id1, /^workflow:\/worktree-a:\d+:\d+$/);
+});
+
+test("agentIdFor keeps one stable id per named thread (a thread is one continuing session)", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  const first = agent.agentIdFor({ thread: "implementer" }, "/worktree");
+  const again = agent.agentIdFor({ thread: "implementer" }, "/worktree");
+  const other = agent.agentIdFor({ thread: "reviewer" }, "/worktree");
+  assert.equal(again, first, "thread turns continue one session, so the id must be stable");
+  assert.notEqual(other, first, "distinct threads must not share an id");
+});
+
+test("agentIdFor ids never collide across separate WorkflowAgent instances", () => {
+  const first = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  const second = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  // Unthreaded one-shot calls: every invocation gets a fresh id, across instances too.
+  assert.notEqual(
+    first.agentIdFor({}, "/worktree"),
+    second.agentIdFor({}, "/worktree"),
+    "unthreaded ids from separate instances must not collide",
+  );
+  // Named threads: stable within one instance, but the same thread name on a
+  // separate instance must not reuse the id (process-global AgentRegistry).
+  assert.notEqual(
+    first.agentIdFor({ thread: "implementer" }, "/worktree"),
+    second.agentIdFor({ thread: "implementer" }, "/worktree"),
+    "the same thread name on separate instances must not share an AgentRegistry id",
+  );
+});
+
 test("WorkflowAgent retains one session manager per named thread", () => {
   const agent = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
   const first = agent.createSessionManager("implementer");
@@ -86,6 +179,378 @@ test("WorkflowAgent retains one session manager per named thread", () => {
   const nextInvocation = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
   assert.notEqual(nextInvocation.createSessionManager("implementer").getSessionId(), first.getSessionId());
   assert.notEqual(agent.createSessionManager(), agent.createSessionManager(), "unthreaded calls remain one-shot");
+});
+
+test("WorkflowAgent rejects a named thread when its canonical cwd changes", () => {
+  const firstCwd = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-thread-cwd-first-"));
+  const secondCwd = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-thread-cwd-second-"));
+  try {
+    const agent = new WorkflowAgent({ cwd: firstCwd }) as unknown as WorkflowAgentPrivates;
+    const first = agent.createSessionManager("implementer", firstCwd);
+    assert.equal(
+      agent.createSessionManager("implementer", firstCwd),
+      first,
+      "same canonical cwd retains the conversation",
+    );
+    assert.throws(
+      () => agent.createSessionManager("implementer", secondCwd),
+      (error: unknown) => {
+        assert.ok(error instanceof WorkflowError);
+        assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+        return true;
+      },
+    );
+  } finally {
+    rmSync(firstCwd, { recursive: true, force: true });
+    rmSync(secondCwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run keeps constructor tools when its cwd is a symlink", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-cwd-symlink-home-"));
+  const root = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-cwd-symlink-"));
+  const linked = join(root, "linked");
+  symlinkSync(root, linked);
+  const core = createFauxCore({
+    provider: "fauxtest-cwd-symlink",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const registry = await fauxRegistry(home, "fauxtest-cwd-symlink", core);
+      let customToolCalls = 0;
+      const customTool = defineTool({
+        name: "constructor_cwd_sentinel",
+        label: "Constructor cwd sentinel",
+        description: "Proves constructor-provided tools survive cwd canonicalization.",
+        parameters: Type.Object({}),
+        execute: async () => {
+          customToolCalls++;
+          return { content: [{ type: "text", text: "sentinel reached" }] };
+        },
+      });
+      core.setResponses([
+        fauxAssistantMessage(fauxToolCall("constructor_cwd_sentinel", {}), { stopReason: "toolUse" }),
+        fauxAssistantMessage("custom tool survived", { stopReason: "stop" }),
+      ]);
+
+      const agent = new WorkflowAgent({ cwd: linked, tools: [customTool], modelRegistry: registry });
+      const result = await agent.run("call the constructor cwd sentinel", {
+        model: "fauxtest-cwd-symlink/faux-model",
+      });
+
+      assert.equal(customToolCalls, 1, "the canonicalized default cwd must retain constructor tools");
+      assert.match(result, /custom tool survived/);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run preserves a valid trailing-space cwd", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-cwd-space-home-"));
+  const root = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-cwd-space-"));
+  const plain = join(root, "target");
+  const trailing = join(root, "target ");
+  mkdirSync(plain);
+  mkdirSync(trailing);
+  const core = createFauxCore({
+    provider: "fauxtest-cwd-space",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const registry = await fauxRegistry(home, "fauxtest-cwd-space", core);
+      const contexts: unknown[] = [];
+      core.setResponses([
+        fauxAssistantMessage(fauxToolCall("bash", { command: "pwd" }), { stopReason: "toolUse" }),
+        (context) => {
+          contexts.push(context);
+          return fauxAssistantMessage("observed cwd", { stopReason: "stop" });
+        },
+      ]);
+
+      const agent = new WorkflowAgent({ cwd: root, modelRegistry: registry });
+      await agent.run("run pwd", { cwd: trailing, model: "fauxtest-cwd-space/faux-model" });
+
+      assert.match(
+        bashToolResultText(contexts.at(-1)),
+        new RegExp(realpathSync(trailing).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+        "bash must execute in the literal trailing-space directory",
+      );
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run gives an explicit cwd precedence over an injected session cwd", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-session-cwd-home-"));
+  const oldCwd = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-session-cwd-old-"));
+  const targetCwd = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-session-cwd-target-"));
+  const core = createFauxCore({
+    provider: "fauxtest-session-cwd",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const registry = await fauxRegistry(home, "fauxtest-session-cwd", core);
+      const contexts: unknown[] = [];
+      core.setResponses([
+        (context) => {
+          contexts.push(context);
+          return fauxAssistantMessage(fauxToolCall("bash", { command: "pwd" }), { stopReason: "toolUse" });
+        },
+        (context) => {
+          contexts.push(context);
+          return fauxAssistantMessage("observed explicit cwd", { stopReason: "stop" });
+        },
+      ]);
+
+      const agent = new WorkflowAgent({
+        cwd: oldCwd,
+        modelRegistry: registry,
+        session: { cwd: oldCwd },
+      });
+      await agent.run("run pwd from the selected directory", {
+        cwd: targetCwd,
+        model: "fauxtest-session-cwd/faux-model",
+      });
+
+      const toolResult = bashToolResultText(contexts.at(-1));
+      assert.match(
+        toolResult,
+        new RegExp(realpathSync(targetCwd).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+        "bash must execute in the explicit cwd after session option merging",
+      );
+      assert.doesNotMatch(
+        toolResult,
+        new RegExp(realpathSync(oldCwd).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+        "the injected session cwd must not control bash execution",
+      );
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(oldCwd, { recursive: true, force: true });
+    rmSync(targetCwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run keeps injected settings and resources while using the explicit cwd", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-injected-session-home-"));
+  const injectedCwd = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-injected-session-old-"));
+  const targetCwd = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-injected-session-target-"));
+  writeFileSync(join(injectedCwd, "AGENTS.md"), "INJECTED_RESOURCE_LOADER_MARKER");
+  writeFileSync(join(targetCwd, "AGENTS.md"), "TARGET_RESOURCE_LOADER_MARKER");
+  const core = createFauxCore({
+    provider: "fauxtest-injected-session",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const registry = await fauxRegistry(home, "fauxtest-injected-session", core);
+      const settingsManager = SettingsManager.inMemory();
+      const resourceLoader = new DefaultResourceLoader({
+        cwd: injectedCwd,
+        agentDir: home,
+        settingsManager,
+        noExtensions: true,
+      });
+      await resourceLoader.reload();
+      let injectedSettingsReads = 0;
+      const originalGetCompactionSettings = settingsManager.getCompactionSettings.bind(settingsManager);
+      settingsManager.getCompactionSettings = () => {
+        injectedSettingsReads++;
+        return originalGetCompactionSettings();
+      };
+      const contexts: unknown[] = [];
+      core.setResponses([
+        (context) => {
+          contexts.push(context);
+          return fauxAssistantMessage(fauxToolCall("bash", { command: "pwd" }), { stopReason: "toolUse" });
+        },
+        (context) => {
+          contexts.push(context);
+          return fauxAssistantMessage("observed injected dependencies", { stopReason: "stop" });
+        },
+      ]);
+
+      const agent = new WorkflowAgent({
+        cwd: injectedCwd,
+        modelRegistry: registry,
+        session: { settingsManager, resourceLoader },
+      });
+      await agent.run("prove the host dependencies remain in effect", {
+        cwd: targetCwd,
+        model: "fauxtest-injected-session/faux-model",
+      });
+
+      const initialRequest = JSON.stringify(contexts[0]);
+      assert.match(initialRequest, /INJECTED_RESOURCE_LOADER_MARKER/);
+      assert.doesNotMatch(initialRequest, /TARGET_RESOURCE_LOADER_MARKER/);
+      assert.ok(injectedSettingsReads > 0, "the SDK session must retain the host-injected SettingsManager");
+      assert.match(
+        bashToolResultText(contexts[1]),
+        new RegExp(realpathSync(targetCwd).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+        "injected dependencies must not override explicit cwd",
+      );
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(injectedCwd, { recursive: true, force: true });
+    rmSync(targetCwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run lets the default resource loader use an injected SettingsManager", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-settings-loader-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-settings-loader-cwd-"));
+  const projectPiDir = join(cwd, ".pi");
+  const marker = "INJECTED_SETTINGS_APPEND_SYSTEM_MARKER";
+  mkdirSync(projectPiDir);
+  writeFileSync(join(projectPiDir, "APPEND_SYSTEM.md"), marker);
+  const core = createFauxCore({
+    provider: "fauxtest-settings-loader",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const registry = await fauxRegistry(home, "fauxtest-settings-loader", core);
+      const settingsManager = SettingsManager.inMemory({}, { projectTrusted: true });
+      const contexts: unknown[] = [];
+      core.setResponses([
+        (context) => {
+          contexts.push(context);
+          return fauxAssistantMessage("settings loader marker observed", { stopReason: "stop" });
+        },
+      ]);
+
+      const agent = new WorkflowAgent({
+        cwd,
+        modelRegistry: registry,
+        // Deliberately inject only settingsManager: the default loader must be
+        // built by WorkflowAgent with this manager and the run cwd.
+        session: { settingsManager },
+      });
+      const result = await agent.run("confirm the project append-system marker", {
+        model: "fauxtest-settings-loader/faux-model",
+      });
+
+      assert.match(result, /settings loader marker observed/);
+      assert.match(
+        (contexts[0] as { systemPrompt?: string }).systemPrompt ?? "",
+        new RegExp(marker),
+        "the default loader must read project APPEND_SYSTEM.md using the injected trust settings",
+      );
+      const loaders = (agent as unknown as { resourceLoaders: Map<string, unknown> }).resourceLoaders;
+      assert.equal(loaders.size, 1, "the default loader path must be used when resourceLoader is not injected");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run fixes a named thread to its first canonical cwd", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-thread-cwd-run-home-"));
+  const first = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-thread-cwd-run-first-"));
+  const second = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-thread-cwd-run-second-"));
+  const firstAlias = join(first, "alias");
+  symlinkSync(first, firstAlias);
+  const core = createFauxCore({
+    provider: "fauxtest-thread-cwd-run",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const registry = await fauxRegistry(home, "fauxtest-thread-cwd-run", core);
+      const contexts: unknown[] = [];
+      core.setResponses([
+        fauxAssistantMessage("first answer", { stopReason: "stop" }),
+        (context) => {
+          contexts.push(context);
+          return fauxAssistantMessage("same thread answer", { stopReason: "stop" });
+        },
+      ]);
+      const agent = new WorkflowAgent({ cwd: first, modelRegistry: registry });
+      const options = { thread: "implementer", model: "fauxtest-thread-cwd-run/faux-model" } as const;
+
+      await agent.run("FIRST_THREAD_MARKER", { ...options, cwd: first });
+      await assert.rejects(agent.run("MUST_NOT_RUN", { ...options, cwd: second }), (error: unknown) => {
+        assert.ok(error instanceof WorkflowError);
+        assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+        assert.match(error.message, /cannot change cwd/);
+        return true;
+      });
+      await agent.run("ALIAS_THREAD_MARKER", { ...options, cwd: firstAlias });
+
+      const transcript = JSON.stringify(contexts);
+      assert.match(transcript, /FIRST_THREAD_MARKER/, "a same-realpath alias must reuse the existing transcript");
+      assert.match(transcript, /ALIAS_THREAD_MARKER/);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(first, { recursive: true, force: true });
+    rmSync(second, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run loads AGENTS resources per canonical cwd and reuses only the matching loader", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-cwd-resources-home-"));
+  const root = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-cwd-resources-"));
+  const first = join(root, "first");
+  const second = join(root, "second");
+  const firstAlias = join(root, "first-alias");
+  mkdirSync(first);
+  mkdirSync(second);
+  symlinkSync(first, firstAlias);
+  writeFileSync(join(first, "AGENTS.md"), "FIRST_CWD_AGENTS_MARKER");
+  writeFileSync(join(second, "AGENTS.md"), "SECOND_CWD_AGENTS_MARKER");
+  const core = createFauxCore({
+    provider: "fauxtest-cwd-resources",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const registry = await fauxRegistry(home, "fauxtest-cwd-resources", core);
+      const contexts: unknown[] = [];
+      core.setResponses([
+        (context) => {
+          contexts.push(context);
+          return fauxAssistantMessage("first", { stopReason: "stop" });
+        },
+        (context) => {
+          contexts.push(context);
+          return fauxAssistantMessage("second", { stopReason: "stop" });
+        },
+        (context) => {
+          contexts.push(context);
+          return fauxAssistantMessage("first again", { stopReason: "stop" });
+        },
+      ]);
+      const agent = new WorkflowAgent({ cwd: first, modelRegistry: registry });
+      const model = "fauxtest-cwd-resources/faux-model";
+
+      await agent.run("first cwd", { cwd: first, model });
+      await agent.run("second cwd", { cwd: second, model });
+      await agent.run("first alias", { cwd: firstAlias, model });
+
+      const transcripts = contexts.map((context) => JSON.stringify(context));
+      assert.match(transcripts[0], /FIRST_CWD_AGENTS_MARKER/);
+      assert.doesNotMatch(transcripts[0], /SECOND_CWD_AGENTS_MARKER/);
+      assert.match(transcripts[1], /SECOND_CWD_AGENTS_MARKER/);
+      assert.doesNotMatch(transcripts[1], /FIRST_CWD_AGENTS_MARKER/);
+      assert.match(transcripts[2], /FIRST_CWD_AGENTS_MARKER/, "a same-realpath alias must use the first loader");
+
+      const loaders = (agent as unknown as { resourceLoaders: Map<string, unknown> }).resourceLoaders;
+      assert.equal(loaders.size, 2, "one loader per canonical cwd; the alias must not allocate a third");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("WorkflowAgent restores a failed named turn to its previous leaf", () => {
@@ -307,6 +772,28 @@ test("WorkflowAgent#loadTierConfig: memoization is per-instance (two agents, two
   );
 });
 
+test("WorkflowAgent#loadTierConfig: default loader overlays project tiers over global", () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-tier-overlay-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-tier-overlay-cwd-"));
+  try {
+    withFakeHome(home, () => {
+      const globalPath = getModelTierConfigPath();
+      const projectPath = getProjectModelTierConfigPath(cwd);
+      mkdirSync(join(globalPath, ".."), { recursive: true });
+      mkdirSync(join(projectPath, ".."), { recursive: true });
+      writeFileSync(globalPath, JSON.stringify({ tiers: { small: "global/small", medium: "global/medium" } }));
+      writeFileSync(projectPath, JSON.stringify({ tiers: { small: "project/small" } }));
+
+      const agent = new WorkflowAgent({ cwd }) as unknown as WorkflowAgentTierPrivates;
+      const loaded = agent.loadTierConfig();
+      assert.deepEqual(loaded, { tiers: { small: "project/small", medium: "global/medium" } });
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("WorkflowAgent.run(): tier routing resolves correctly through the real (non-injected) disk loader, read only once across two run() calls", async () => {
   // End-to-end proof that memoization doesn't break the real wiring: writes an
   // actual model-tiers.json to a fake home, runs two real subagents against a
@@ -363,6 +850,108 @@ test("WorkflowAgent.run(): tier routing resolves correctly through the real (non
         firstResult,
         secondResult,
         "the SAME config object must be reused across run() calls — the file was read/parsed only once",
+      );
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run() reports per-turn in-flight usage for a named thread", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-live-usage-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-live-usage-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-live-usage",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+    tokenSize: { min: 1, max: 1 },
+    tokensPerSecond: 200,
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest-live-usage", {
+        name: "Faux Test Live Usage",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple,
+        models: core.models.map((model) => ({
+          id: model.id,
+          name: model.name ?? model.id,
+          reasoning: false,
+          input: ["text" as const],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: model.contextWindow ?? 128000,
+          maxTokens: model.maxTokens ?? 4096,
+        })),
+      });
+      core.setResponses([
+        fauxAssistantMessage("streaming output proves this agent is active", { stopReason: "stop" }),
+        fauxAssistantMessage("the second threaded turn has independent usage", { stopReason: "stop" }),
+      ]);
+
+      const registry = new ModelRegistry(runtime);
+      const agent = new WorkflowAgent({
+        cwd,
+        modelRegistry: registry,
+        mainModel: "fauxtest-live-usage/faux-model",
+      });
+      let settled = false;
+      let terminalCalls = 0;
+      let resolveFirstProgress: (usage: AgentUsage) => void = () => {};
+      const firstProgress = new Promise<AgentUsage>((resolve) => {
+        resolveFirstProgress = resolve;
+      });
+
+      const thread = "live-usage-thread";
+      const run = agent
+        .run("respond slowly", {
+          thread,
+          model: "fauxtest-live-usage/faux-model",
+          onUsageProgress: (usage) => {
+            if (usage.total > 0) {
+              resolveFirstProgress(usage);
+            }
+          },
+          onUsage: () => {
+            terminalCalls++;
+          },
+        })
+        .finally(() => {
+          settled = true;
+        });
+      let progressTimeout: ReturnType<typeof setTimeout> | undefined;
+      const missingProgress = new Promise<never>((resolve, reject) => {
+        void resolve;
+        progressTimeout = setTimeout(() => reject(new Error("No in-flight usage was reported")), 30_000);
+      });
+      const progress = await Promise.race([firstProgress, missingProgress]);
+      if (progressTimeout) {
+        clearTimeout(progressTimeout);
+      }
+
+      assert.equal(settled, false, "progress must arrive before the subagent settles");
+      assert.ok(progress.output > 0, "streaming text should produce a positive output estimate");
+      await run;
+      assert.equal(terminalCalls, 1, "onUsage remains a once-only terminal callback");
+
+      const secondProgress: AgentUsage[] = [];
+      let secondTerminal: AgentUsage | undefined;
+      await agent.run("continue in the same thread", {
+        thread,
+        model: "fauxtest-live-usage/faux-model",
+        onUsageProgress: (usage) => secondProgress.push(usage),
+        onUsage: (usage) => {
+          secondTerminal = usage;
+        },
+      });
+
+      assert.ok(secondProgress.length > 0, "the second turn should stream usage");
+      assert.deepEqual(
+        secondProgress.at(-1),
+        secondTerminal,
+        "the last live update must describe this turn only, matching its terminal usage",
       );
     });
   } finally {
@@ -851,7 +1440,7 @@ test("subagentExcludedTools always includes the defaults, plus caller/session na
   assert.ok(merged.includes("session-denied") && merged.includes("extra"), "both caller lists are folded in");
 });
 
-test("the subagent resource loader is built once per run and shared across subagents (#109)", () => {
+test("the subagent resource loader is built once per directory and shared across subagents (#109)", () => {
   // The #109 mitigation: one no-extensions loader per run, reused by every
   // subagent, instead of createAgentSession re-running every extension factory
   // (and rooting each disposed session) per subagent. Memoization is the invariant.
@@ -864,6 +1453,28 @@ test("the subagent resource loader is built once per run and shared across subag
   // reload() may reject in a bare temp dir; we only assert memoization here.
   first.catch(() => {});
   second.catch(() => {});
+});
+
+test("a failed per-directory resource loader is evicted before the next attempt (#109)", async () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  type Priv = { getSharedResourceLoader(agentDir: string, cwd: string): Promise<unknown> };
+  const privateAgent = agent as unknown as Priv;
+  const originalReload = DefaultResourceLoader.prototype.reload;
+  let reloadAttempts = 0;
+  DefaultResourceLoader.prototype.reload = async function reloadForFailureTest() {
+    reloadAttempts++;
+    throw new Error("injected loader reload failure");
+  };
+  try {
+    const first = privateAgent.getSharedResourceLoader("/tmp/agentdir", "/tmp");
+    await assert.rejects(first, /injected loader reload failure/);
+    const second = privateAgent.getSharedResourceLoader("/tmp/agentdir", "/tmp");
+    assert.notEqual(second, first, "a rejected promise must not stay memoized for this directory");
+    await assert.rejects(second, /injected loader reload failure/);
+    assert.equal(reloadAttempts, 2, "the next call must construct and reload a fresh loader");
+  } finally {
+    DefaultResourceLoader.prototype.reload = originalReload;
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1396,6 +2007,132 @@ test("agent() passes onModelResolved callback for display model updates", async 
   assert.ok(rec.calls.length > 0, "rec.calls should not be empty");
 });
 
+test("onAgentModel corrects a RUNNING agent's model, not just the finished one", async () => {
+  const rec = new CallRecordingAgent();
+  const order: string[] = [];
+  let startEvent: { id: string; model?: string } | undefined;
+  let modelEvent: { id: string; model: string } | undefined;
+  let endModel: string | undefined;
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     await agent('task', { label: 't' })
+     return 1`,
+    {
+      agent: rec,
+      persistLogs: false,
+      mainModel: "main-prov/main-model",
+      onAgentStart: (e) => {
+        order.push("start");
+        startEvent = { id: e.id, model: e.model };
+      },
+      onAgentModel: (e) => {
+        order.push("model");
+        modelEvent = { id: e.id, model: e.model };
+      },
+      onAgentEnd: (e) => {
+        order.push("end");
+        endModel = e.model;
+      },
+    },
+  );
+  assert.equal(startEvent?.model, "main-prov/main-model", "onAgentStart can only carry the pre-resolution guess");
+  assert.equal(modelEvent?.model, "openai/gpt-4.1-mini", "onAgentModel carries the id the agent actually runs on");
+  assert.equal(modelEvent?.id, startEvent?.id, "same per-call id, so the host can match it to the started row");
+  assert.deepEqual(order, ["start", "model", "end"], "the correction must land BEFORE the agent finishes");
+  assert.equal(endModel, "openai/gpt-4.1-mini", "onAgentEnd still carries the resolved model");
+});
+
+test("onAgentModel fires for a tier-tagged agent, whose start event cannot know the tier's model", async () => {
+  const rec = new CallRecordingAgent();
+  const models: string[] = [];
+  let startModel: string | undefined;
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     await agent('task', { label: 't', tier: 'big' })
+     return 1`,
+    {
+      agent: rec,
+      persistLogs: false,
+      mainModel: "main-prov/main-model",
+      onAgentStart: (e) => {
+        startModel = e.model;
+      },
+      onAgentModel: (e) => models.push(e.model),
+    },
+  );
+  // A tier defers the choice to the agent layer, so agent() deliberately passes
+  // model: undefined and the start event falls back to the session's main model.
+  assert.equal(rec.calls[0].options.model, undefined, "a tier must not be pre-resolved into an explicit model");
+  assert.equal(rec.calls[0].options.tier, "big");
+  assert.equal(startModel, "main-prov/main-model");
+  assert.deepEqual(models, ["openai/gpt-4.1-mini"], "the tier's real model is pushed while the agent runs");
+});
+
+test("a replayed (cache-hit) agent reports the model it actually ran on, not the main model", async () => {
+  const rec = new CallRecordingAgent();
+  const journal: JournalEntry[] = [];
+  const script = `export const meta = { name: 'test', description: 't' }
+     await agent('task', { label: 't' })
+     return 1`;
+  await runWorkflow(script, {
+    agent: rec,
+    persistLogs: false,
+    runId: "replay-model-run",
+    mainModel: "main-prov/main-model",
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(journal.length, 1);
+  assert.equal(journal[0].model, "openai/gpt-4.1-mini", "the resolved model is journaled with the result");
+
+  const replayed: Array<string | undefined> = [];
+  const secondRec = new CallRecordingAgent();
+  await runWorkflow(script, {
+    agent: secondRec,
+    persistLogs: false,
+    runId: "replay-model-run",
+    mainModel: "main-prov/main-model",
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e] as const)),
+    onAgentStart: (e) => replayed.push(e.model),
+    onAgentEnd: (e) => replayed.push(e.model),
+  });
+  assert.equal(secondRec.calls.length, 0, "the call must cache-hit, so nothing re-resolves the model");
+  assert.deepEqual(
+    replayed,
+    ["openai/gpt-4.1-mini", "openai/gpt-4.1-mini"],
+    "resume must not regress a replayed row back to the main model",
+  );
+});
+
+test("a legacy journal entry with no model degrades to the pre-resolution guess", async () => {
+  const rec = new CallRecordingAgent();
+  const journal: JournalEntry[] = [];
+  const script = `export const meta = { name: 'test', description: 't' }
+     await agent('task', { label: 't' })
+     return 1`;
+  await runWorkflow(script, {
+    agent: rec,
+    persistLogs: false,
+    runId: "legacy-model-run",
+    mainModel: "main-prov/main-model",
+    onAgentJournal: (e) => journal.push(e),
+  });
+  const legacy = journal.map(({ model: _dropped, ...rest }) => rest as JournalEntry);
+  const replayed: Array<string | undefined> = [];
+  await runWorkflow(script, {
+    agent: new CallRecordingAgent(),
+    persistLogs: false,
+    runId: "legacy-model-run",
+    mainModel: "main-prov/main-model",
+    resumeJournal: new Map(legacy.map((e) => [`${e.runId}:${e.index}`, e] as const)),
+    onAgentStart: (e) => replayed.push(e.model),
+  });
+  assert.deepEqual(
+    replayed,
+    ["main-prov/main-model"],
+    "no journaled model => same behavior as before the field existed",
+  );
+});
+
 test("agent() accumulates usage across multiple agents", async () => {
   const rec = new CallRecordingAgent();
   const usageEvents: Array<{ total: number }> = [];
@@ -1549,4 +2286,46 @@ test("usageFromStats keeps cost-only stats (billed but tokens unreported)", () =
     cost: 0.01,
   });
   assert.equal(usage?.cost, 0.01);
+});
+// ═══════════════════════════════════════════════════════════════════════
+// runtimeOf + 3-way fallback registry construction (omp / legacy / stock pi)
+// ═══════════════════════════════════════════════════════════════════════
+
+test("runtimeOf returns the backing ModelRuntime on stock pi and undefined on a fork-style registry", async () => {
+  const authDir = mkdtempSync(join(tmpdir(), "pi-dw-runtime-of-"));
+  try {
+    const runtime = await ModelRuntime.create({ authPath: join(authDir, "auth.json"), modelsPath: null });
+    const registry = new ModelRegistry(runtime);
+    assert.equal(runtimeOf(registry), runtime, "stock pi ModelRegistry must expose its runtime for subagent handoff");
+    // omp's auth-storage-backed registry carries no own `.runtime`; the seam
+    // must report undefined there so callers pass the registry itself instead.
+    const forkRegistry: ModelRegistry = Object.create(Object.getPrototypeOf(registry));
+    assert.equal(runtimeOf(forkRegistry), undefined);
+  } finally {
+    rmSync(authDir, { recursive: true, force: true });
+  }
+});
+
+test("stock pi exposes neither omp's discoverAuthStorage nor a legacy static ModelRegistry.create (fallback must use ModelRuntime.create)", async () => {
+  assert.equal(typeof ModelRuntime.create, "function", "runtime-split construction path must exist on stock pi");
+  const mod = await import("@earendil-works/pi-coding-agent");
+  assert.equal("discoverAuthStorage" in mod, false, "omp-only discovery export must not exist on stock pi");
+  assert.equal("create" in ModelRegistry, false, "legacy static create must not exist on stock pi");
+});
+
+test("fallback registry resolves to a real ModelRegistry on stock pi and is cached across agents (never undefined)", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-fallback-home-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const agent1 = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+      const agent2 = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+      const first = await agent1.getRegistry();
+      assert.ok(first instanceof ModelRegistry, "fallback must resolve to a real registry, never undefined");
+      assert.ok(runtimeOf(first), "stock-pi fallback registry must carry a runtime for subagent handoff");
+      assert.equal(await agent1.getRegistry(), first, "per-agent fallback must be reused");
+      assert.equal(await agent2.getRegistry(), first, "module-level fallback registry must be shared across agents");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });

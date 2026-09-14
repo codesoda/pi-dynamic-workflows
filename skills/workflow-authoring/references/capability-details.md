@@ -2,7 +2,7 @@
 # Exhaustive workflow capability facts
 
 Contract format: `1.0.0`<br>
-Contract content / skill / extension: `3.7.0`
+Contract content / skill / extension: `3.11.0`
 
 Every exact fact below is projected from the installed extension's capability contract. Explanatory judgment belongs in the hand-written references next to this file.
 
@@ -17,8 +17,11 @@ Every exact fact below is projected from the installed extension's capability co
 - `phase`: string (optional; default: current phase)
 - `schema`: plain JSON Schema (optional)
 - `model`: string (optional; highest-priority exact model selector)
+- `thinking`: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" (optional; call-site value overrides agentType thinking; selected model suffix takes precedence; invalid values fail before dispatch)
 - `tier`: string (optional; configured route name; dynamic reference: model-routes)
-- `isolation`: "worktree" (optional)
+- `isolation`: "worktree" | false (optional)
+- `keepWorktree`: boolean (optional; default: true)
+- `cwd`: string (optional; non-empty absolute existing directory; resolved to its real path; coding tools and session cwd use the target directory; settings and AGENTS/skill resources also use it unless explicitly injected by the embedding host; cannot combine with worktree isolation)
 - `thread`: string (optional; non-empty name; same-name calls must be sequential)
 - `agentType`: string (optional; must come from provided context; dynamic reference: agent-types)
 - `timeoutMs`: number | null (optional; default: run timeout; null disables)
@@ -30,10 +33,15 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: a named thread retains its full Pi transcript and session identity only within one uninterrupted workflow invocation
 - Constraint: threaded calls are live-execution resume barriers and are never journaled
 - Constraint: same-thread calls must be sequential; threads cannot use worktree isolation
+- Constraint: a named thread's canonical cwd is fixed by its first call; a later call using that name with a different cwd fails validation instead of reusing the prior transcript
+- Constraint: an explicit cwd must be a non-empty absolute existing directory; its real path determines coding tools and session cwd; default settings and AGENTS/skill resources follow it while embedding-host dependency overrides remain authoritative; it participates in resume identity and cannot combine with worktree isolation
 - Constraint: selector priority is explicit model > agentType model > tier > phase model > metadata model > implicit medium > session default
 - Constraint: an explicit model, agentType model, tier, or phase model that resolves to an unavailable model throws MODEL_NOT_FOUND naming the source (e.g. the tier and what it resolved to) instead of falling back
 - Constraint: only the implicit default medium tier (no explicit model, tier, agentType, or phase model requested) degrades to the session default when unavailable, logging a one-time run-visible warning instead of throwing
-- Constraint: worktree isolation is best-effort; failure logs that isolation was ignored and continues without an isolated working directory
+- Constraint: requested worktree isolation fails closed before agent execution if git cannot create the worktree; it never falls back to the shared checkout
+- Constraint: isolation: false opts out of an agentType worktree default
+- Constraint: keepWorktree defaults true (worktree kept for merge); false deletes after the call
+- Constraint: each live execution creates a uniquely owned worktree; retries or resume never reuse or overwrite a retained worktree
 
 <a id="parallel"></a>
 ## parallel

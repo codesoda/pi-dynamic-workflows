@@ -5,7 +5,7 @@
 import { join } from "node:path";
 import type { AgentUsage } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
-import type { WorkflowErrorCode } from "./errors.js";
+import { WorkflowErrorCode } from "./errors.js";
 import {
   ensureDir as ensureDirFs,
   listJsonFilesSafe,
@@ -44,6 +44,17 @@ export interface PersistedAgentState {
   model?: string;
 }
 
+/** Serialized journal entry; runId is absent on legacy numeric-only journals. */
+export interface PersistedJournalEntry {
+  index: number;
+  runId?: string;
+  hash: string;
+  result: unknown;
+  storeDelta?: Record<string, unknown>;
+  /** The model the call ran on; absent on journals written before this field existed. */
+  model?: string;
+}
+
 export interface PersistedRunState {
   runId: string;
   workflowName: string;
@@ -53,6 +64,16 @@ export interface PersistedRunState {
    * the navigator shows only the current session's runs (undefined = legacy/global). */
   sessionId?: string;
   status: RunStatus;
+  /**
+   * Terminal failure/abort message. Written for `failed` and `aborted` runs;
+   * absent on running/paused/completed and on records persisted before this field.
+   */
+  error?: string;
+  /**
+   * Classified terminal cause. Written with `error` for `failed` and `aborted`
+   * runs; absent on running/paused/completed and on legacy records.
+   */
+  errorCode?: WorkflowErrorCode;
   /** Why a paused run is paused (e.g. "usage_limit" when a provider quota was hit). */
   pauseReason?: string;
   /** Provider reset hint for a usage-limit pause, e.g. "Resets in ~3h" (verbatim). */
@@ -78,17 +99,11 @@ export interface PersistedRunState {
    * Cached agent/checkpoint results for resume, keyed by deterministic call
    * index. `runId` namespaces `index` (a nested workflow() call restarts its
    * own callSeq at 0) — absent on journals persisted before that namespacing
-   * existed; see JournalEntry.runId in workflow.ts for the resume-time
-   * legacy-degradation behavior. `storeDelta` is this call's SharedStore
-   * write delta, replayed additively on resume.
+   * existed; see PersistedJournalEntry.runId in workflow.ts / the manager's
+   * resume() for the resume-time legacy-degradation behavior. `storeDelta` is
+   * this call's SharedStore write delta, replayed additively on resume.
    */
-  journal?: Array<{
-    index: number;
-    runId?: string;
-    hash: string;
-    result: unknown;
-    storeDelta?: Record<string, unknown>;
-  }>;
+  journal?: PersistedJournalEntry[];
   /**
    * Opt-out of auto-resume for this run (default true, i.e. eligible unless
    * explicitly set to false via ExecOptions.autoResume). Set once at run start
@@ -155,7 +170,9 @@ export interface PersistedRunState {
  * Disk/memory marker for a background result that still needs conversation
  * delivery. Kept small on purpose — never store full agent transcripts here.
  */
-export type PendingDeliveryMarker = { kind: "complete" } | { kind: "text"; text: string };
+export type PendingDeliveryMarker =
+  | { kind: "complete"; deliveryId?: string }
+  | { kind: "text"; text: string; deliveryId?: string };
 
 export interface RunPersistence {
   /** Save current run state. */
@@ -209,7 +226,72 @@ export type FsLayer = PersistenceFsLayer;
  */
 export const DEFAULT_MAX_TERMINAL_RUNS_ON_DISK = 300;
 
-const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set(["completed", "failed", "aborted"]);
+export const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set(["completed", "failed", "aborted"]);
+
+const NON_TERMINAL_AGENT_STATUSES = new Set(["queued", "running"]);
+
+/** Cause stamped onto leftover agents when a live execution is gone but the run is still paused. */
+export const INTERRUPTED_AGENT_CAUSE: { error: string; errorCode: WorkflowErrorCode } = {
+  error: "interrupted",
+  errorCode: WorkflowErrorCode.WORKFLOW_ABORTED,
+};
+
+export function agentHasNonTerminalStatus(status: PersistedAgentState["status"]): boolean {
+  return NON_TERMINAL_AGENT_STATUSES.has(status);
+}
+
+/** Cause stamped onto leftover in-flight agents when a run reaches a terminal status. */
+export function terminalRunInterruptCause(
+  status: RunStatus,
+  error?: { message?: string; code?: WorkflowErrorCode },
+): { error: string; errorCode?: WorkflowErrorCode } {
+  if (status === "aborted") {
+    return { error: "aborted", errorCode: error?.code ?? WorkflowErrorCode.WORKFLOW_ABORTED };
+  }
+  if (status === "failed") {
+    return {
+      error: error?.message ?? "run failed",
+      errorCode: error?.code ?? WorkflowErrorCode.UNKNOWN,
+    };
+  }
+  return { error: "run completed" };
+}
+
+/**
+ * Rewrite leftover queued/running agents to skipped. Replay ignores
+ * `agents[].status` (journal-keyed), so this is display-only.
+ */
+export function settleInterruptedPersistedAgents(
+  agents: PersistedAgentState[],
+  cause: { error: string; errorCode?: WorkflowErrorCode },
+  endedAt: string,
+): PersistedAgentState[] {
+  return agents.map((agent) => {
+    if (!NON_TERMINAL_AGENT_STATUSES.has(agent.status)) return agent;
+    return {
+      ...agent,
+      status: "skipped",
+      error: cause.error,
+      errorCode: cause.errorCode,
+      recoverable: false,
+      endedAt: agent.endedAt ?? endedAt,
+    };
+  });
+}
+
+/**
+ * Fail-closed rewrite of leftover queued/running agents on a terminal run.
+ * Completed/failed/aborted must never persist a still-`running` agent.
+ */
+export function settleNonTerminalPersistedAgents(
+  agents: PersistedAgentState[],
+  status: RunStatus,
+  error: { message?: string; code?: WorkflowErrorCode } | undefined,
+  endedAt: string,
+): PersistedAgentState[] {
+  if (!TERMINAL_RUN_STATUSES.has(status)) return agents;
+  return settleInterruptedPersistedAgents(agents, terminalRunInterruptCause(status, error), endedAt);
+}
 
 export interface RunPersistenceOptions {
   /** Override DEFAULT_MAX_TERMINAL_RUNS_ON_DISK (tests; advanced tuning). */
@@ -362,11 +444,11 @@ export function createRunPersistence(
   // Bound the number of terminal (completed/failed/aborted) runs kept on
   // disk (see DEFAULT_MAX_TERMINAL_RUNS_ON_DISK) — called after every save()
   // whose state is terminal, since that's the only time the terminal count
-  // can grow. Running/paused runs are never candidates: they're filtered out
-  // before the cap is even considered.
+  // can grow. Running/paused and undelivered runs are never candidates: they're
+  // filtered out before the cap is even considered.
   const enforceRetention = () => {
     const terminal = computeList()
-      .filter((r) => TERMINAL_RUN_STATUSES.has(r.status))
+      .filter((r) => TERMINAL_RUN_STATUSES.has(r.status) && !r.pendingDelivery)
       .sort((a, b) => new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime());
     const excess = terminal.length - maxTerminalRunsOnDisk;
     if (excess <= 0) return;
