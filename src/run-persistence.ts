@@ -15,6 +15,7 @@ import {
   unlinkIfExistsSafe,
   writeJsonAtomicWithBackup,
 } from "./fs-persistence.js";
+import type { WorkflowCheckpoint } from "./workflow.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
@@ -42,6 +43,10 @@ export interface PersistedAgentState {
   tokenUsage?: AgentUsage;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
+  /** Child SessionManager identity, captured before the first prompt. */
+  sessionId?: string;
+  /** Child session file, absent for in-memory child sessions. */
+  sessionFile?: string;
 }
 
 /** Serialized journal entry; runId is absent on legacy numeric-only journals. */
@@ -60,9 +65,14 @@ export interface PersistedRunState {
   workflowName: string;
   script: string;
   args?: unknown;
-  /** The pi session this run belongs to. Runs persist on disk across sessions but
-   * the navigator shows only the current session's runs (undefined = legacy/global). */
+  /** The pi session currently used for run ownership/delivery. Runs persist on
+   * disk across sessions but the navigator shows only the current session's
+   * runs (undefined = legacy/global). */
   sessionId?: string;
+  /** Immutable parent session identity for this workflow run. */
+  parentSessionId?: string;
+  /** Immutable parent session file for this workflow run, when persisted. */
+  parentSessionFile?: string;
   status: RunStatus;
   /**
    * Terminal failure/abort message. Written for `failed` and `aborted` runs;
@@ -78,6 +88,8 @@ export interface PersistedRunState {
   pauseReason?: string;
   /** Provider reset hint for a usage-limit pause, e.g. "Resets in ~3h" (verbatim). */
   resetHint?: string;
+  /** Durable workflow-controlled suspension and its at-most-once response. */
+  checkpoint?: WorkflowCheckpoint;
   phases: string[];
   currentPhase?: string;
   agents: PersistedAgentState[];

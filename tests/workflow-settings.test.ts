@@ -188,6 +188,30 @@ describe("workflow settings", () => {
     }
   });
 
+  it("normalizes repo-local defaultEffort before applying external project overrides", () => {
+    withSettingsPath((settingsPath) => {
+      const projectLocalSettingsPath = join(dirname(settingsPath), "repo-settings.json");
+      const projectSettingsPath = join(dirname(settingsPath), "project-settings.json");
+      const options = { settingsPath, projectLocalSettingsPath, projectSettingsPath };
+      saveWorkflowSettings({ defaultEffort: "high" }, settingsPath);
+
+      assert.deepEqual(loadWorkflowSettings(options), { defaultEffort: "high" });
+      writeFileSync(projectLocalSettingsPath, JSON.stringify({ defaultEffort: "ultra" }));
+      assert.deepEqual(loadWorkflowSettings(options), { defaultEffort: "ultra" });
+      assert.deepEqual(loadWorkflowSettings(settingsPath), { defaultEffort: "high" });
+
+      for (const value of [{ defaultEffort: "HIGH" }, [], null]) {
+        writeFileSync(projectLocalSettingsPath, JSON.stringify(value));
+        assert.deepEqual(loadWorkflowSettings(options), { defaultEffort: "high" });
+      }
+
+      writeFileSync(projectLocalSettingsPath, JSON.stringify({ defaultEffort: "ultra" }));
+      saveWorkflowSettings({ defaultEffort: "off" }, { ...options, scope: "project" });
+      assert.deepEqual(loadWorkflowSettings(options), { defaultEffort: "off" });
+      assert.deepEqual(JSON.parse(readFileSync(projectLocalSettingsPath, "utf-8")), { defaultEffort: "ultra" });
+    });
+  });
+
   it("merges project settings over global settings when cwd is provided", () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-project-settings-"));
     const cwd = join(dir, "project");

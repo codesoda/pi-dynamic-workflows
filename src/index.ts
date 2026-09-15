@@ -74,7 +74,13 @@ export type {
   PreSpawnModelResolver,
 } from "./pre-spawn-model.js";
 export { getPreSpawnModelResolver, setPreSpawnModelResolver } from "./pre-spawn-model.js";
-export type { PendingDeliveryMarker, PersistedRunState, RunPersistence, RunStatus } from "./run-persistence.js";
+export type {
+  PendingDeliveryMarker,
+  PersistedAgentState,
+  PersistedRunState,
+  RunPersistence,
+  RunStatus,
+} from "./run-persistence.js";
 export { createRunPersistence, generateRunId } from "./run-persistence.js";
 export {
   parseCommandArgs,
@@ -110,6 +116,8 @@ export type {
   AgentOptions,
   JournalEntry,
   SharedRuntime,
+  WorkflowCheckpoint,
+  WorkflowCheckpointInput,
   WorkflowMeta,
   WorkflowMetaPhase,
   WorkflowRunOptions,
@@ -160,7 +168,7 @@ export {
   registerWorkflowTriggerCommand,
   type WorkflowModeState,
 } from "./workflow-editor.js";
-export type { ManagedRun, WorkflowManagerOptions } from "./workflow-manager.js";
+export type { ManagedRun, WorkflowManagerOptions, WorkflowResumeOptions } from "./workflow-manager.js";
 export { WorkflowManager } from "./workflow-manager.js";
 export type { WorkflowProjectPaths } from "./workflow-paths.js";
 export {
